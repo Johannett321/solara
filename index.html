@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Solara</title>
+    <meta name="description" content="An open-world driving and exploration prototype, generated entirely at runtime from code." />
+    <!-- Inline so the build stays asset-free and the browser stops asking for /favicon.ico. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0d12'/%3E%3Cpath d='M4 22h24' stroke='%23ffd24a' stroke-width='2.5' stroke-linecap='round'/%3E%3Ccircle cx='16' cy='13' r='6' fill='%23ff9ec4'/%3E%3C/svg%3E"
+    />
+    <style>
+      :root { color-scheme: dark; }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { width: 100%; height: 100%; overflow: hidden; background: #0b0d12; }
+      body { font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif; }
+      canvas { display: block; width: 100%; height: 100%; }
+
+      #hud {
+        position: fixed; inset: 0; pointer-events: none;
+        text-shadow: 0 1px 3px rgba(0,0,0,.75);
+      }
+      #location {
+        position: absolute; left: 28px; bottom: 26px;
+        color: #fff; letter-spacing: .16em; text-transform: uppercase;
+        font-size: 13px; font-weight: 600; opacity: 0; transform: translateY(6px);
+        transition: opacity .8s ease, transform .8s ease;
+      }
+      #location.show { opacity: .92; transform: translateY(0); }
+      #location small {
+        display: block; font-size: 10px; letter-spacing: .3em;
+        font-weight: 500; opacity: .7; margin-top: 4px;
+      }
+      #stats {
+        position: absolute; right: 14px; top: 12px; color: #9ff; opacity: .5;
+        font: 500 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        text-align: right; white-space: pre;
+      }
+
+      /* Contextual "press F" prompt */
+      #prompt {
+        position: absolute; left: 50%; bottom: 22%; transform: translateX(-50%) translateY(8px);
+        color: #fff; font-size: 14px; letter-spacing: .06em;
+        background: rgba(12,15,20,.62); border: 1px solid rgba(255,255,255,.16);
+        border-radius: 8px; padding: 9px 16px; backdrop-filter: blur(6px);
+        opacity: 0; transition: opacity .18s ease, transform .18s ease;
+      }
+      #prompt.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+      #prompt b {
+        display: inline-block; min-width: 20px; text-align: center;
+        background: #ffd24a; color: #16181d; border-radius: 4px;
+        padding: 1px 6px; margin-right: 8px; font-weight: 800;
+      }
+
+      /* Speedometer */
+      #speedo {
+        position: absolute; right: 40px; bottom: 40px; text-align: right;
+        color: #fff; opacity: 0; transition: opacity .3s ease;
+      }
+      #speedo.show { opacity: .95; }
+      #speedo .kph {
+        font: 800 54px/1 ui-sans-serif, system-ui, sans-serif;
+        font-variant-numeric: tabular-nums; letter-spacing: -.02em;
+      }
+      #speedo .unit {
+        font: 700 11px/1 ui-sans-serif, system-ui, sans-serif;
+        letter-spacing: .34em; opacity: .6; margin-top: 6px;
+      }
+
+      /* Pause map */
+      #map {
+        position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column;
+        background: rgba(6,8,12,.82); backdrop-filter: blur(10px);
+        opacity: 0; pointer-events: none; transition: opacity .22s ease;
+      }
+      #map.show { opacity: 1; pointer-events: auto; }
+      #map header {
+        display: flex; align-items: baseline; gap: 16px;
+        padding: 22px 30px 14px; color: #fff;
+      }
+      #map h2 {
+        font-size: 15px; font-weight: 700; letter-spacing: .3em; text-transform: uppercase;
+      }
+      #map header span { font-size: 12px; opacity: .5; letter-spacing: .1em; }
+      #map header .spacer { flex: 1; }
+      #map .hint { font-size: 11px; opacity: .45; letter-spacing: .08em; }
+      #mapCanvas {
+        flex: 1; margin: 0 30px 24px; border-radius: 10px; cursor: grab;
+        border: 1px solid rgba(255,255,255,.1); width: auto; height: auto;
+      }
+      #mapCanvas:active { cursor: grabbing; }
+      #map footer {
+        display: flex; gap: 26px; padding: 0 30px 24px;
+        color: #9aa4b2; font-size: 11px; letter-spacing: .08em;
+      }
+      #map footer i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 7px; font-style: normal; }
+      #map button {
+        pointer-events: auto; cursor: pointer; font: inherit;
+        font-size: 11px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase;
+        color: #12161f; background: #ffd24a; border: 0; border-radius: 999px;
+        padding: 9px 22px;
+      }
+      #map button.ghost {
+        background: transparent; color: #9aa4b2;
+        border: 1px solid rgba(255,255,255,.18); margin-right: 8px;
+      }
+      #map button.ghost:hover { color: #fff; border-color: rgba(255,255,255,.4); }
+
+      #start {
+        position: fixed; inset: 0; display: grid; place-items: center;
+        background: radial-gradient(120% 90% at 50% 40%, #1b2436 0%, #080a10 70%);
+        color: #fff; z-index: 10; transition: opacity .6s ease;
+      }
+      #start.hide { opacity: 0; pointer-events: none; }
+      #start .card { text-align: center; max-width: 460px; padding: 0 24px; }
+      #start h1 {
+        font-size: 68px; font-weight: 800; letter-spacing: .22em;
+        margin-left: .22em;
+        background: linear-gradient(180deg, #ffe8c9 0%, #ff9ec4 55%, #7ad4ff 100%);
+        -webkit-background-clip: text; background-clip: text; color: transparent;
+      }
+      #start h2 {
+        font-size: 12px; letter-spacing: .42em; opacity: .55;
+        font-weight: 500; margin: 2px 0 30px .42em;
+      }
+      #start .keys {
+        display: grid; grid-template-columns: auto 1fr; gap: 8px 16px;
+        font-size: 13px; opacity: .72; text-align: left; margin: 0 auto 32px;
+        width: max-content;
+      }
+      #start kbd {
+        background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.16);
+        border-bottom-width: 2px; border-radius: 5px; padding: 2px 7px;
+        font: 600 11px/1.6 ui-monospace, Menlo, monospace;
+      }
+      #start button {
+        pointer-events: auto; cursor: pointer; font: inherit;
+        font-size: 13px; font-weight: 700; letter-spacing: .18em; text-transform: uppercase;
+        color: #12161f; background: linear-gradient(180deg,#fff,#ffd9e6);
+        border: 0; border-radius: 999px; padding: 14px 40px;
+        transition: transform .15s ease, box-shadow .15s ease;
+        box-shadow: 0 8px 30px -8px rgba(255,158,196,.7);
+      }
+      #start button:hover { transform: translateY(-2px); box-shadow: 0 14px 36px -10px rgba(255,158,196,.9); }
+      #loading { font-size: 12px; letter-spacing: .3em; opacity: .5; text-transform: uppercase; }
+    </style>
+  </head>
+  <body>
+    <div id="hud">
+      <div id="location">Ocean Drive<small>Palmera Beach &middot; Solara</small></div>
+      <div id="stats"></div>
+      <div id="prompt"><b>F</b><span id="promptText">Enter vehicle</span></div>
+      <div id="speedo"><div class="kph">0</div><div class="unit">KM/H</div></div>
+    </div>
+
+    <div id="map">
+      <header>
+        <h2>Solara</h2>
+        <span>Palmera Beach &middot; Ocean Drive</span>
+        <div class="spacer"></div>
+        <span class="hint">Drag to pan &middot; Scroll to zoom</span>
+        <button id="mapMute" class="ghost">Sound: on</button>
+        <button id="mapClose">Resume</button>
+      </header>
+      <canvas id="mapCanvas"></canvas>
+      <footer>
+        <span><i style="background:#ffd24a"></i>You</span>
+        <span><i style="background:#5fd1e8"></i>Vehicle</span>
+        <span><i style="background:#8fe6d2"></i>Boat</span>
+        <span><i style="background:#6f7a88"></i>Pedestrian</span>
+        <span><i style="background:#20272f"></i>Building</span>
+        <span class="hint">Esc closes the map</span>
+      </footer>
+    </div>
+
+    <div id="start">
+      <div class="card">
+        <h1>SOLARA</h1>
+        <h2>Palmera Beach</h2>
+        <div class="keys">
+          <span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></span><span>Move</span>
+          <span><kbd>Space</kbd></span><span>Jump &middot; handbrake</span>
+          <span><kbd>Shift</kbd></span><span>Sprint</span>
+          <span><kbd>F</kbd></span><span>Enter / exit vehicle &middot; boat</span>
+          <span><kbd>Mouse</kbd></span><span>Look around</span>
+          <span><kbd>Esc</kbd></span><span>Map</span>
+          <span><kbd>N</kbd></span><span>Mute</span>
+        </div>
+        <button id="play" disabled><span id="loading">Loading</span></button>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

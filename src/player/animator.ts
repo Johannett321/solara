@@ -1,0 +1,453 @@
+import * as THREE from 'three';
+import { MaraRig, P } from './rig';
+
+/**
+ * Procedural locomotion. There is no animation clip anywhere in this project —
+ * every joint angle below is evaluated from the gait phase, and the gait phase
+ * advances with distance actually travelled, so the feet never skate no matter
+ * how the speed ramps.
+ */
+
+/** Shortest signed angular difference. */
+function angDiff(a: number, b: number): number {
+  let d = (a - b) % (Math.PI * 2);
+  if (d > Math.PI) d -= Math.PI * 2;
+  if (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
+/** Gaussian bump on the gait circle — the building block for joint curves. */
+function bump(phase: number, centre: number, width: number): number {
+  const d = angDiff(phase, centre);
+  return Math.exp(-(d * d) / (2 * width * width));
+}
+
+const PI = Math.PI;
+
+export const GAIT = {
+  walkSpeed: 1.65,
+  runSpeed: 5.1,
+  /** Ground covered by one full two-step cycle, per gait. */
+  walkCycle: 1.55,
+  runCycle: 3.1,
+  /** Matches Controller's JUMP_SPEED; used to normalise vertical velocity. */
+  jumpSpeed: 5.1,
+} as const;
+
+export interface LocomotionState {
+  /** Horizontal speed, m/s. */
+  speed: number;
+  /** Ground distance covered this frame, m. */
+  distance: number;
+  /** Yaw change, rad/s. */
+  turnRate: number;
+  /** Surface height under her feet. */
+  groundY: number;
+  grounded: boolean;
+  /** Vertical velocity, m/s. */
+  vy: number;
+  /** True for the single frame she touches down. */
+  justLanded: boolean;
+  /** Out of her depth: front crawl instead of a walk cycle. */
+  swimming?: boolean;
+  /** Water depth underfoot, for the wading blend. */
+  depth?: number;
+}
+
+interface Link {
+  vx: number;
+  vz: number;
+  restX: number;
+  restZ: number;
+}
+
+export class MaraAnimator {
+  private phase = 0;
+  private gait = 0;
+  private run01 = 0;
+  private breath = 0;
+  private idleT = 0;
+  private lookYaw = 0;
+  private lookPitch = 0;
+  private lookTimer = 0;
+
+  private air = 0;
+  private land = 0;
+  private swim = 0;
+  private stroke = 0;
+
+  /**
+   * Fired the moment a foot plants. Only the player's animator sets this — the
+   * whole crowd shares this class, and a hundred pairs of footsteps would be
+   * both deafening and pointless.
+   */
+  onFootPlant?: (side: -1 | 1) => void;
+  /** Half-cycle accumulator; one step per PI of gait phase. */
+  private stepAccum = 0;
+  private stepSide: -1 | 1 = 1;
+
+  private links: Link[];
+  private prevHead = new THREE.Vector3();
+  private headVel = new THREE.Vector3();
+  private headAcc = new THREE.Vector3();
+  private hasPrev = false;
+
+  private tmp = new THREE.Vector3();
+  private tmpQ = new THREE.Quaternion();
+
+  constructor(private rig: MaraRig) {
+    this.links = rig.ponytail.map((l) => ({
+      vx: 0,
+      vz: 0,
+      restX: l.rotation.x,
+      restZ: l.rotation.z,
+    }));
+  }
+
+  update(dt: number, st: LocomotionState): void {
+    const r = this.rig;
+    const { speed, distance, turnRate, groundY } = st;
+
+    // Swim weight, eased so entering and leaving the water isn't a snap.
+    this.swim += ((st.swimming ? 1 : 0) - this.swim) * Math.min(1, dt * 4);
+    this.stroke += dt * (1.4 + Math.min(1, speed / 2.2) * 2.4);
+
+    // Airborne weight, eased so takeoff and touchdown aren't instant pops.
+    this.air += ((st.grounded ? 0 : 1) - this.air) * Math.min(1, dt * 16);
+    if (st.justLanded) this.land = 1;
+    this.land = Math.max(0, this.land - dt / 0.34);
+
+    /* -------------------------------------------------------- blending */
+
+    const targetGait = THREE.MathUtils.smoothstep(speed, 0.12, 0.9);
+    // Ease in/out of the gait so a tap of W doesn't snap the legs open.
+    this.gait += (targetGait - this.gait) * Math.min(1, dt * 11);
+
+    const targetRun = THREE.MathUtils.clamp(
+      (speed - GAIT.walkSpeed) / (GAIT.runSpeed - GAIT.walkSpeed),
+      0,
+      1,
+    );
+    this.run01 += (targetRun - this.run01) * Math.min(1, dt * 7);
+    const run = this.run01;
+
+    const cycle = THREE.MathUtils.lerp(GAIT.walkCycle, GAIT.runCycle, run);
+    const advance = (distance / cycle) * PI * 2;
+    this.phase = (this.phase + advance) % (PI * 2);
+
+    // Steps are driven off the same distance-based advance as the pose, so the
+    // sound lands on the frame the foot actually touches down.
+    if (this.onFootPlant) {
+      this.stepAccum += advance;
+      while (this.stepAccum >= PI) {
+        this.stepAccum -= PI;
+        if (this.gait > 0.3 && st.grounded && !st.swimming) this.onFootPlant(this.stepSide);
+        this.stepSide = this.stepSide === 1 ? -1 : 1;
+      }
+    }
+    // Keep a slow idle-side cadence so the blend out of walking stays smooth.
+    const ph = this.phase;
+    const g = this.gait;
+
+    this.breath += dt * (1.1 + run * 2.2);
+    this.idleT += dt;
+
+    /* ------------------------------------------------------------ legs */
+
+    const thighAmp = THREE.MathUtils.lerp(0.52, 0.92, run) * g;
+    const kneeSwing = THREE.MathUtils.lerp(1.12, 1.55, run);
+    const kneeStance = THREE.MathUtils.lerp(0.2, 0.34, run);
+
+    const poseLeg = (leg: typeof r.legL, phase: number, side: number) => {
+      // Thigh: negative rotation.x swings the leg toward +Z (forward).
+      leg.hip.rotation.x = -thighAmp * Math.cos(phase);
+      // Slight outward splay, plus hip drop compensation.
+      leg.hip.rotation.z = side * (0.035 + 0.02 * g);
+      leg.hip.rotation.y = side * 0.02;
+
+      const flex =
+        kneeStance * bump(phase, 0.26 * PI, 0.34) +
+        kneeSwing * bump(phase, 1.3 * PI, 0.56) +
+        0.05;
+      leg.knee.rotation.x = flex * g + (1 - g) * 0.045;
+
+      const ankle =
+        -0.2 * bump(phase, 0.02 * PI, 0.3) +
+        0.52 * bump(phase, 0.96 * PI, 0.32) -
+        0.22 * bump(phase, 1.45 * PI, 0.42);
+      leg.ankle.rotation.x = ankle * g;
+    };
+
+    poseLeg(r.legL, ph, 1);
+    poseLeg(r.legR, ph + PI, -1);
+
+    /* ------------------------------------------------------------ arms */
+
+    const armAmp = THREE.MathUtils.lerp(0.44, 0.86, run) * g;
+    const baseBend = 0.22 + run * 0.62;
+
+    const poseArm = (arm: typeof r.armL, phase: number, side: number) => {
+      arm.shoulder.rotation.x = -armAmp * Math.cos(phase) + (1 - g) * 0.04;
+      // Held just clear of the hips, opening slightly at a run.
+      arm.shoulder.rotation.z = side * (0.075 + 0.035 * g + 0.04 * run);
+      arm.shoulder.rotation.y = side * (-0.04 - 0.1 * run * g);
+
+      const swingBend = Math.max(0, Math.cos(phase)) * (0.22 + run * 0.5);
+      arm.elbow.rotation.x = -(baseBend + swingBend * g);
+      arm.elbow.rotation.y = side * 0.04;
+
+      arm.wrist.rotation.x = -0.08 - 0.12 * run * g;
+      arm.wrist.rotation.z = side * 0.05;
+    };
+
+    // Arms counter-swing against the legs.
+    poseArm(r.armL, ph + PI, 1);
+    poseArm(r.armR, ph, -1);
+
+    /* ---------------------------------------------------------- pelvis */
+
+    const bobAmp = THREE.MathUtils.lerp(0.028, 0.085, run) * g;
+    // Two rises per cycle: highest at each mid-stance.
+    const bob = (1 - Math.cos(ph * 2)) * 0.5 * bobAmp;
+
+    const idleSway = (1 - g) * Math.sin(this.idleT * 0.85) * 0.018;
+    const idleBreath = (1 - g) * Math.sin(this.breath) * 0.006;
+
+    r.hips.position.y = P.hipY + bob + idleBreath;
+    r.hips.position.x = idleSway;
+
+    // Pelvis drops toward the swing side, and counter-rotates against the chest.
+    const yawAmp = THREE.MathUtils.lerp(0.09, 0.17, run) * g;
+    r.hips.rotation.y = -yawAmp * Math.cos(ph);
+    r.hips.rotation.z = Math.sin(ph) * 0.055 * g + idleSway * 1.4;
+
+    // Bank into turns.
+    const bank = THREE.MathUtils.clamp(-turnRate * 0.11, -0.16, 0.16) * (0.3 + g);
+    r.hips.rotation.z += bank;
+
+    /* ----------------------------------------------------- spine/chest */
+
+    const lean = 0.045 * g + 0.24 * run * g;
+    r.spine.rotation.x = -lean + Math.sin(this.breath) * 0.012 * (1 - g);
+    r.spine.rotation.y = yawAmp * 1.25 * Math.cos(ph);
+    r.spine.rotation.z = -bank * 0.5;
+
+    r.chest.rotation.y = yawAmp * 0.5 * Math.cos(ph);
+    r.chest.rotation.x = Math.sin(this.breath) * 0.016;
+
+    /* ------------------------------------------------------------ head */
+
+    // Idle glances: she looks around when standing still.
+    this.lookTimer -= dt;
+    if (this.lookTimer <= 0) {
+      this.lookTimer = 2.2 + Math.random() * 3.4;
+      this.lookYaw = (Math.random() - 0.5) * 1.0;
+      this.lookPitch = (Math.random() - 0.5) * 0.22;
+    }
+    const lookW = (1 - g) * 0.85;
+
+    // Gaze stabilisation: cancel the torso lean so she keeps her eyes level.
+    r.head.rotation.x = lean * 0.72 - this.lookPitch * lookW - Math.sin(ph * 2) * 0.014 * g;
+    r.head.rotation.y =
+      -(r.spine.rotation.y + r.chest.rotation.y) * 0.55 + this.lookYaw * lookW;
+    r.head.rotation.z = -r.hips.rotation.z * 0.3;
+
+    /* -------------------------------------------------- jump / landing */
+
+    if (this.air > 0.001) this.poseAir(st.vy, this.air);
+    if (this.land > 0.001) this.poseLanding(this.land);
+    if (this.swim > 0.001) this.poseSwim(this.swim, speed);
+
+    /* -------------------------------------------- foot planting (IK) */
+
+    // Meaningless while airborne or afloat — the feet are supposed to be off
+    // the ground in both cases.
+    const ikWeight = (1 - this.air) * (1 - this.swim);
+    if (ikWeight > 0.01) {
+      r.root.updateMatrixWorld(true);
+      const targetY = groundY + P.ankleY;
+      let lowest = Infinity;
+      for (const leg of [r.legL, r.legR]) {
+        leg.ankle.getWorldPosition(this.tmp);
+        lowest = Math.min(lowest, this.tmp.y);
+      }
+      if (Number.isFinite(lowest)) {
+        // Drop the pelvis until the trailing foot reaches the pavement.
+        const delta = THREE.MathUtils.clamp(lowest - targetY, -0.14, 0.14);
+        r.hips.position.y -= delta * ikWeight;
+      }
+    }
+
+    /* ------------------------------------------------- ponytail spring */
+
+    this.updatePonytail(dt, g, run);
+  }
+
+  /**
+   * Airborne pose, blended over whatever the gait produced. Rising tucks the
+   * legs and throws the arms up; falling extends the lead leg to reach for the
+   * ground. The two legs are deliberately asymmetric — a perfectly mirrored
+   * jump reads as a mannequin.
+   */
+  private poseAir(vy: number, w: number): void {
+    const r = this.rig;
+    // +1 rising hard, -1 falling hard.
+    const v = THREE.MathUtils.clamp(vy / GAIT.jumpSpeed, -1, 1);
+    const rise = Math.max(0, v);
+    const fall = Math.max(0, -v);
+    const mix = (o: THREE.Object3D, x: number, z = o.rotation.z) => {
+      o.rotation.x = THREE.MathUtils.lerp(o.rotation.x, x, w);
+      o.rotation.z = THREE.MathUtils.lerp(o.rotation.z, z, w);
+    };
+
+    // Lead leg tucks hard on the way up, reaches out on the way down.
+    mix(r.legL.hip, -(0.5 + rise * 0.5 - fall * 0.24), 0.05);
+    mix(r.legL.knee, 0.85 + rise * 0.75 - fall * 0.55);
+    mix(r.legL.ankle, -0.1 - fall * 0.22);
+
+    // Trailing leg stays straighter and swings behind.
+    mix(r.legR.hip, 0.12 + rise * 0.3 - fall * 0.3, -0.05);
+    mix(r.legR.knee, 0.42 + rise * 0.55 - fall * 0.28);
+    mix(r.legR.ankle, 0.16 + rise * 0.2 - fall * 0.3);
+
+    mix(r.armL.shoulder, -(0.85 + rise * 0.75), 0.34 + fall * 0.28);
+    mix(r.armL.elbow, -(0.7 + rise * 0.3));
+    mix(r.armR.shoulder, 0.3 - rise * 0.25, -(0.3 + fall * 0.3));
+    mix(r.armR.elbow, -(0.55 + rise * 0.25));
+
+    r.spine.rotation.x = THREE.MathUtils.lerp(
+      r.spine.rotation.x,
+      -0.14 - rise * 0.1 + fall * 0.06,
+      w,
+    );
+    r.hips.rotation.y = THREE.MathUtils.lerp(r.hips.rotation.y, -0.1, w);
+    r.spine.rotation.y = THREE.MathUtils.lerp(r.spine.rotation.y, 0.14, w);
+    // Chin comes up as she leaves the ground.
+    r.head.rotation.x = THREE.MathUtils.lerp(r.head.rotation.x, -0.08 + fall * 0.16, w);
+  }
+
+  /** Absorb the impact: knees fold, pelvis drops, torso pitches forward. */
+  private poseLanding(t: number): void {
+    const r = this.rig;
+    // Sharp at touchdown, easing out — a linear recovery looks robotic.
+    const k = Math.pow(t, 1.6);
+    r.hips.position.y -= k * 0.16;
+    for (const leg of [r.legL, r.legR]) {
+      leg.hip.rotation.x -= k * 0.34;
+      leg.knee.rotation.x += k * 0.78;
+      leg.ankle.rotation.x -= k * 0.3;
+    }
+    r.spine.rotation.x -= k * 0.24;
+    for (const arm of [r.armL, r.armR]) {
+      arm.shoulder.rotation.x -= k * 0.3;
+      arm.elbow.rotation.x -= k * 0.35;
+    }
+  }
+
+  /**
+   * Front crawl. The body pitches forward to lie prone at the surface, the arms
+   * windmill a half-cycle out of phase, and the legs flutter from the hip with
+   * almost straight knees.
+   */
+  private poseSwim(w: number, speed: number): void {
+    const r = this.rig;
+    const p = this.stroke;
+    // Barely moving is a lazy tread rather than a full stroke.
+    const effort = 0.35 + Math.min(1, speed / 2.2) * 0.65;
+
+    const mix = (o: THREE.Object3D, x: number, y = o.rotation.y, z = o.rotation.z) => {
+      o.rotation.x = THREE.MathUtils.lerp(o.rotation.x, x, w);
+      o.rotation.y = THREE.MathUtils.lerp(o.rotation.y, y, w);
+      o.rotation.z = THREE.MathUtils.lerp(o.rotation.z, z, w);
+    };
+
+    // Prone: pitch the whole body down so she lies along the surface.
+    r.hips.rotation.x = THREE.MathUtils.lerp(r.hips.rotation.x, -1.32, w);
+    r.hips.rotation.y = THREE.MathUtils.lerp(r.hips.rotation.y, 0, w);
+    r.hips.rotation.z = THREE.MathUtils.lerp(
+      r.hips.rotation.z,
+      Math.sin(p) * 0.22 * effort,
+      w,
+    );
+    r.hips.position.y = THREE.MathUtils.lerp(r.hips.position.y, P.hipY * 0.72, w);
+
+    r.spine.rotation.x = THREE.MathUtils.lerp(r.spine.rotation.x, 0.16, w);
+    r.spine.rotation.y = THREE.MathUtils.lerp(r.spine.rotation.y, 0, w);
+    // Head lifts to breathe on alternate strokes.
+    r.head.rotation.x = THREE.MathUtils.lerp(r.head.rotation.x, 0.95, w);
+    r.head.rotation.y = THREE.MathUtils.lerp(
+      r.head.rotation.y,
+      Math.sin(p * 0.5) * 0.5,
+      w,
+    );
+
+    // Arms: full windmill, half a cycle apart.
+    for (const [arm, phase, s] of [
+      [r.armL, p, 1],
+      [r.armR, p + PI, -1],
+    ] as const) {
+      const a = Math.cos(phase);
+      mix(arm.shoulder, -1.6 - a * 1.5 * effort, s * 0.12, s * (0.22 + 0.1 * effort));
+      // Elbow bends on the recovery, straightens through the pull.
+      mix(arm.elbow, -(0.25 + Math.max(0, a) * 0.9) * effort);
+      mix(arm.wrist, -0.1);
+    }
+
+    // Legs: shallow flutter kick, knees nearly locked.
+    for (const [leg, phase, s] of [
+      [r.legL, p * 2, 1],
+      [r.legR, p * 2 + PI, -1],
+    ] as const) {
+      const k = Math.sin(phase);
+      mix(leg.hip, -k * 0.34 * effort, 0, s * 0.05);
+      mix(leg.knee, 0.18 + Math.max(0, k) * 0.5 * effort);
+      mix(leg.ankle, 0.42 - k * 0.2);
+    }
+  }
+
+  /** Damped angular springs driven by the head's own acceleration. */
+  private updatePonytail(dt: number, gait: number, run: number): void {
+    const r = this.rig;
+    r.head.getWorldPosition(this.tmp);
+
+    if (!this.hasPrev) {
+      this.prevHead.copy(this.tmp);
+      this.hasPrev = true;
+      return;
+    }
+
+    const inv = dt > 1e-5 ? 1 / dt : 0;
+    const vel = this.tmp.clone().sub(this.prevHead).multiplyScalar(inv);
+    const acc = vel.clone().sub(this.headVel).multiplyScalar(inv);
+    this.headVel.copy(vel);
+    this.prevHead.copy(this.tmp);
+    // Heavy smoothing — raw frame-to-frame acceleration is far too spiky.
+    this.headAcc.lerp(acc, Math.min(1, dt * 12));
+
+    // Express the acceleration in the head's own frame.
+    r.head.getWorldQuaternion(this.tmpQ).invert();
+    const local = this.headAcc.clone().applyQuaternion(this.tmpQ);
+
+    const stiffness = 62;
+    const damping = 9.5;
+
+    for (let i = 0; i < this.links.length; i++) {
+      const link = r.ponytail[i];
+      const s = this.links[i];
+      // Links further down the tail respond more.
+      const w = 0.28 + (i / this.links.length) * 0.72;
+
+      const targetX =
+        s.restX -
+        THREE.MathUtils.clamp(local.z, -26, 26) * 0.0075 * w +
+        gait * (0.05 + run * 0.14) * w;
+      const targetZ = s.restZ + THREE.MathUtils.clamp(local.x, -26, 26) * 0.009 * w;
+
+      s.vx += ((targetX - link.rotation.x) * stiffness - s.vx * damping) * dt;
+      s.vz += ((targetZ - link.rotation.z) * stiffness - s.vz * damping) * dt;
+
+      link.rotation.x = THREE.MathUtils.clamp(link.rotation.x + s.vx * dt, -0.9, 1.5);
+      link.rotation.z = THREE.MathUtils.clamp(link.rotation.z + s.vz * dt, -0.7, 0.7);
+    }
+  }
+}

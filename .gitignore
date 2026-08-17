@@ -1,0 +1,25 @@
+# Dependencies
+node_modules
+
+# Build output
+dist
+*.tsbuildinfo
+
+# Local env / editor
+.env
+.env.*
+!.env.example
+.vscode
+.idea
+*.swp
+
+# macOS / Windows cruft
+.DS_Store
+Thumbs.db
+
+# Tooling scratch
+.playwright-cli
+.vite
+
+# Old pre-rename screenshot library (superseded by docs/img)
+shots
