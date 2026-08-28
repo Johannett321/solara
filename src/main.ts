@@ -3,6 +3,7 @@ import { buildSky } from './render/sky';
 import { buildClouds } from './render/clouds';
 import { buildWeather } from './render/weather';
 import { buildPost } from './render/post';
+import { buildLights } from './render/lights';
 import { buildWorld } from './world';
 import { buildMara } from './player/rig';
 import { MaraAnimator, GAIT, AIM_POSE, REACTIONS } from './player/animator';
@@ -61,6 +62,10 @@ scene.add(world.group);
 
 const { rig } = buildMara();
 scene.add(rig.root);
+
+// The only real lights in the world besides the sun and the moon. Allocated
+// once, here, because their *count* is baked into every material's shader.
+const lights = buildLights(scene, world.lamps);
 
 const input = new Input(renderer.domElement);
 const controller = new Controller(input, world.colliders, world.waterHeight);
@@ -130,6 +135,9 @@ post.setSize(innerWidth, innerHeight, Math.min(devicePixelRatio, 1.75));
 // owns the keyframes; everything downstream — exposure, bloom, the grade, the
 // clouds and every artificial light in the world — is driven from them here,
 // so there is no second copy of the schedule to keep in sync.
+/** Latest night factor from the sky's keyframes, 0 by day and 1 after dark. */
+let nightFactor = 0;
+
 const WHITE = new THREE.Color(0xffffff);
 const cloudLit = new THREE.Color();
 const cloudBase = new THREE.Color();
@@ -149,6 +157,7 @@ sky.onState = (s) => {
   // whole look, and ACES desaturates bright sources hard.
   post.setGrade(1.12 + s.night * 0.26, gradeGain.copy(DAY_GAIN).lerp(NIGHT_GAIN, s.night));
   world.setNight(s.night);
+  nightFactor = s.night;
 
   // Clouds take the sun's colour where the light hits and the sky's colour in
   // shadow, both scaled into the same radiance range the dome uses.
@@ -502,6 +511,9 @@ const runOver = {
   halfWidth: 0.95,
   speed: 0,
   taken: false,
+  pushX: 0,
+  pushZ: 0,
+  pushSpin: 0,
 };
 const shadowVolume = new THREE.Frustum();
 
@@ -752,6 +764,16 @@ function frame(): void {
 
   wheel.update(dt);
   world.update(t, dt, focus);
+  // Street lamps follow the camera; the headlamps follow the car. Both are
+  // driven from the sky's night factor, so they come up with the lamp heads
+  // rather than at some second threshold of their own.
+  lights.update(camera.position, nightFactor);
+  lights.setHeadlights(
+    mode === 'driving',
+    mode === 'driving' ? vehicle.position : focus,
+    mode === 'driving' ? vehicle.yaw : 0,
+    nightFactor,
+  );
   weather.update(dt, camera.position);
   sky.update(dt, camera.position);
   clouds.update(dt);

@@ -59,6 +59,25 @@ const SCRUB = 0.34;
 /** Past this much lateral velocity the car counts as drifting, for the HUD. */
 const DRIFT_AT = 3.2;
 
+/**
+ * How bouncy a crash is, 0..1.
+ *
+ * Sheet metal is not a superball: most of a real impact goes into deforming
+ * both cars, and a restitution near 1 makes the street read like dodgems. This
+ * is enough to throw the car off its line and hand the player a moment of
+ * recovery, which is the part that is fun.
+ */
+const RESTITUTION = 0.42;
+/** How much of an off-centre hit turns into spin, per metre of lever arm. */
+const CRASH_SPIN = 0.55;
+/** Crash spin bleeds off this fast, per second. */
+const SPIN_DAMPING = 2.6;
+/** Sideways scrape past a wall keeps this much of its speed along it. */
+const WALL_SLIDE = 0.82;
+
+/** Hoisted: `update` runs every frame and a Vector3 per frame is pure garbage. */
+const right = new THREE.Vector3();
+
 export class VehicleController {
   readonly position = new THREE.Vector3();
   yaw = 0;
@@ -67,6 +86,8 @@ export class VehicleController {
   speed = 0;
   /** Sideways velocity in the car's frame — this is what a slide is. */
   private lateral = 0;
+  /** Rad/s of spin from a crash, damped out over a second or so. */
+  private yawVel = 0;
   /** Current front-wheel angle, eased toward the input. */
   steer = 0;
   /** Accumulated wheel rotation, for rolling the visuals. */
@@ -82,6 +103,35 @@ export class VehicleController {
   /** True once the slide is wide enough to read as a drift. */
   get drifting(): boolean {
     return Math.abs(this.lateral) > DRIFT_AT;
+  }
+
+  /**
+   * Bounce off a surface whose normal is `nx,nz`.
+   *
+   * Splits the velocity into the part going into the surface and the part
+   * sliding along it, reverses the first and keeps most of the second, then
+   * writes the result back into the car's own frame. Doing it this way rather
+   * than scaling `speed` is what makes a glancing blow deflect the car instead
+   * of stopping it.
+   */
+  private bounce(nx: number, nz: number, restitution: number, slide: number, spin: number): void {
+    const right = { x: this.forward.z, z: -this.forward.x };
+    // World velocity.
+    let vx = this.forward.x * this.speed + right.x * this.lateral;
+    let vz = this.forward.z * this.speed + right.z * this.lateral;
+
+    const into = vx * nx + vz * nz;
+    // Already moving away — nothing to bounce off.
+    if (into >= 0) return;
+    const tx = vx - into * nx;
+    const tz = vz - into * nz;
+    vx = tx * slide - into * nx * restitution;
+    vz = tz * slide - into * nz * restitution;
+
+    // Back into the car's frame.
+    this.speed = vx * this.forward.x + vz * this.forward.z;
+    this.lateral = vx * right.x + vz * right.z;
+    this.yawVel += spin;
   }
 
   /** Bleed speed on a soft impact — a body, not a wall. */
@@ -233,7 +283,11 @@ export class VehicleController {
     // itself instead of snapping straight the moment the steering is centred.
     yawRate -= (this.lateral * OVERSTEER) / Math.max(3, Math.abs(this.speed));
 
-    const dYaw = yawRate * dt;
+    // A crash leaves the car rotating on its own, independent of the steering.
+    this.yawVel -= this.yawVel * Math.min(1, SPIN_DAMPING * dt);
+    if (Math.abs(this.yawVel) < 0.01) this.yawVel = 0;
+
+    const dYaw = (yawRate + this.yawVel) * dt;
     this.yaw += dYaw;
 
     // Momentum does not turn with the car. Rotating the body-frame velocity by
@@ -267,7 +321,7 @@ export class VehicleController {
 
     this.prev.copy(this.position);
     this.forward.set(Math.sin(this.yaw), 0, Math.cos(this.yaw));
-    const right = new THREE.Vector3(this.forward.z, 0, -this.forward.x);
+    right.set(this.forward.z, 0, -this.forward.x);
 
     this.position.addScaledVector(this.forward, this.speed * dt);
     this.position.addScaledVector(right, this.lateral * dt);
@@ -280,10 +334,15 @@ export class VehicleController {
 
     this.impact = 0;
     if (before.distanceToSquared(this.position) > 1e-4) {
-      // Scrub off most of the speed on contact and kill the slide.
-      this.impact = Math.min(1, Math.abs(this.speed) / 18);
-      this.speed *= 0.35;
-      this.lateral = 0;
+      // Hitting a wall. `resolve` has already pushed the car out; the push
+      // direction is the surface normal, near enough, so bounce along it and
+      // keep most of the speed *along* the wall. Killing all of it — which is
+      // what this used to do — turns every clipped kerb into a full stop.
+      this.impact = Math.min(1, Math.hypot(this.speed, this.lateral) / 18);
+      const nx = this.position.x - before.x;
+      const nz = this.position.z - before.z;
+      const n = Math.hypot(nx, nz);
+      if (n > 1e-5) this.bounce(nx / n, nz / n, RESTITUTION * 0.8, WALL_SLIDE, 0);
     }
 
     /* ---------------------------------------------------- car to car */
@@ -301,21 +360,38 @@ export class VehicleController {
         const px = this.position.x + this.forward.x * t;
         const pz = this.position.z + this.forward.z * t;
         if (!insideBody(b, px, pz, radius)) continue;
-        // Push straight apart along the line of centres. Both cars are the
-        // same mass here; the AI one is not simulated, so the player takes all
-        // of the separation and all of the speed loss.
+        // Separate along the line of centres, then bounce along it.
         const d = Math.max(0.001, Math.hypot(dx, dz));
+        const nx = -dx / d;
+        const nz = -dz / d;
         const overlap = b.halfLength + radius - d;
         if (overlap > 0) {
-          this.position.x -= (dx / d) * overlap;
-          this.position.z -= (dz / d) * overlap;
+          this.position.x += nx * overlap;
+          this.position.z += nz * overlap;
         }
+
         // Closing speed, not absolute speed: rear-ending someone doing your
-        // own speed should barely register.
-        const closing = Math.abs(this.speed - b.speed * Math.sign(this.forward.z * Math.cos(b.yaw) + this.forward.x * Math.sin(b.yaw) || 1));
-        this.impact = Math.max(this.impact, Math.min(1, closing / 18));
-        this.speed *= 0.45;
-        this.lateral *= 0.4;
+        // own speed should barely register, and a head-on should be brutal.
+        const bx = Math.sin(b.yaw) * b.speed;
+        const bz = Math.cos(b.yaw) * b.speed;
+        const mx = this.forward.x * this.speed + right.x * this.lateral;
+        const mz = this.forward.z * this.speed + right.z * this.lateral;
+        const closing = Math.max(0, (mx - bx) * -nx + (mz - bz) * -nz);
+        this.impact = Math.max(this.impact, Math.min(1, closing / 16));
+
+        // Where along the car it was hit. A corner-to-corner clip spins both
+        // of them; a square rear-ending does not, which is the difference
+        // between a shunt and a wreck.
+        const lever = THREE.MathUtils.clamp(t / half, -1, 1) * half;
+        this.bounce(nx, nz, RESTITUTION, 0.86, -lever * CRASH_SPIN * Math.min(1, closing / 12));
+
+        // And the other car goes the other way. Traffic is on rails, so this
+        // is an impulse it slides on and recovers from rather than a velocity
+        // it keeps — see `pushX` in `world/traffic.ts`.
+        const kick = Math.min(9, closing * 0.55);
+        b.pushX -= nx * kick;
+        b.pushZ -= nz * kick;
+        b.pushSpin += lever * 0.12 * Math.min(1, closing / 12);
         break;
       }
     }

@@ -977,7 +977,13 @@ function cityGround(g: THREE.Group): void {
 
 /* ------------------------------------------------------------- furniture */
 
-function streetFurniture(g: THREE.Group, colliders: Colliders, rng: Rng): void {
+function streetFurniture(
+  g: THREE.Group,
+  colliders: Colliders,
+  rng: Rng,
+  /** Collects the world position of every lamp head placed here. */
+  lamps: THREE.Vector3[],
+): void {
   const m = materials();
   const poleMat = new THREE.MeshStandardMaterial({
     color: 0x8e9298,
@@ -1015,6 +1021,16 @@ function streetFurniture(g: THREE.Group, colliders: Colliders, rng: Rng): void {
     grp.rotation.y = yaw;
     g.add(grp);
     colliders.addCircle(x, z, 0.16, 2.2);
+
+    // The head hangs off the end of the arm, 2.5 m out and 8 m up, and the arm
+    // swings with the mast — so the light is not above the post it stands on.
+    lamps.push(
+      new THREE.Vector3(
+        x + Math.cos(yaw) * 2.5,
+        CURB_H + 8.0,
+        z - Math.sin(yaw) * 2.5,
+      ),
+    );
   };
 
   for (const a of AVENUES) {
@@ -1260,16 +1276,19 @@ const DISTRICTS: District[] = [
 export interface CityResult {
   group: THREE.Group;
   footprints: Footprint[];
+  /** World positions of the cobra heads, for `render/lights.ts`. */
+  lamps: THREE.Vector3[];
 }
 
 export function buildCity(colliders: Colliders): CityResult {
   const g = new THREE.Group();
   g.name = 'city';
   const rng = new Rng(505050);
+  const lamps: THREE.Vector3[] = [];
   const footprints: Footprint[] = [];
 
   cityGround(g);
-  streetFurniture(g, colliders, rng);
+  streetFurniture(g, colliders, rng, lamps);
   expressway(g, colliders, rng);
 
   /** Register a building: geometry is already added; this does the bookkeeping. */
@@ -1401,5 +1420,5 @@ export function buildCity(colliders: Colliders): CityResult {
     }
   }
 
-  return { group: g, footprints };
+  return { group: g, footprints, lamps };
 }

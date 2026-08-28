@@ -554,6 +554,8 @@ function place(
 export interface BuildingsResult {
   group: THREE.Group;
   footprints: Footprint[];
+  /** World positions of the lamp globes, for `render/lights.ts`. */
+  lamps: THREE.Vector3[];
 }
 
 export function buildBuildings(colliders: Colliders): BuildingsResult {
@@ -561,6 +563,7 @@ export function buildBuildings(colliders: Colliders): BuildingsResult {
   g.name = 'buildings';
   const rng = new Rng(918);
   const footprints: Footprint[] = [];
+  const lamps: THREE.Vector3[] = [];
 
   /* ------------------------------------------- the Dominion, hotel side */
 
@@ -689,6 +692,8 @@ export function buildBuildings(colliders: Colliders): BuildingsResult {
       const lamp = promenadeLamp();
       lamp.position.set(side * (ROAD_HALF + 2.2), CURB_H, z);
       g.add(lamp);
+      // The globe sits 4.6 m up the post — see `promenadeLamp`.
+      lamps.push(new THREE.Vector3(side * (ROAD_HALF + 2.2), CURB_H + 4.6, z));
       colliders.addCircle(side * (ROAD_HALF + 2.2), z, 0.2, 2.2);
     }
   }
@@ -701,5 +706,5 @@ export function buildBuildings(colliders: Colliders): BuildingsResult {
   // slabs, and the ones flipped negative were standing in the sea. The city
   // itself is the skyline now.
 
-  return { group: g, footprints };
+  return { group: g, footprints, lamps };
 }

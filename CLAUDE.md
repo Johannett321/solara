@@ -293,6 +293,39 @@ Exposure and emissive levels are coupled: raising both at once blows the frame
 to white. Night sits at exposure ~0.8 with neon around 4.8, not exposure 0.95
 with neon at 12.
 
+### The few real lights
+
+Night is still a materials problem — everything in the section above stands.
+What emissive surfaces cannot do is put light *on* anything, and a street lit
+entirely by them leaves the player a black silhouette on black tarmac, which is
+what midnight actually looked like. `render/lights.ts` adds a small fixed pool
+that follows the player: six point lights handed to the nearest street lamps,
+and two spots for the car's headlamps.
+
+Three rules, all load-bearing:
+
+- **The counts never change.** three bakes the number of lights of each type
+  into every material's shader, so adding or removing one recompiles every
+  program in the scene. Unused lights are parked below the world at zero
+  intensity; they are never removed. The pool is allocated once in `main.ts`.
+- **Nothing here casts a shadow.** The sun's shadow map is already ~6 ms and a
+  second shadow-casting light is another full scene render.
+- **Lamps swap with hysteresis** (`SWAP_MARGIN`). Without it two lamps at
+  nearly equal distance trade the same light back and forth as the player
+  walks, and the street flickers.
+
+Measured at 1500×900 on Ocean Drive at night: 27.3 ms with no added lights,
+29.0 ms with all eight — about **1.7 ms for the lot**. That is affordable for a
+reason specific to this project and worth remembering before adding more: it is
+bound by draw submission, not fill, so per-fragment cost is nearly free. The
+thing that does bite is the uniform upload per draw call, which is why the pool
+is small. Daytime is untouched — every light sits at zero intensity until the
+sky's `night` factor comes up, so midday measured 0 lights on.
+
+Lamp positions are collected at build time into `world.lamps`. Note the city's
+cobra heads hang 2.5 m off the end of an arm that swings with the mast, so the
+light is *not* above the post it stands on.
+
 ### Lighting is a coupled chain — change one, re-check all
 
 Radiance here is authored, not physical, and every value is scaled against the
@@ -532,6 +565,20 @@ Three pieces make it work, and none of them can be dropped:
 Measured at 100 km/h: full lock builds to a held 22–28° slip angle without
 spinning; a hard left then hard right reverses the heading through zero and
 settles into a 25° drift; the handbrake goes straight to a slide.
+
+Crashes are impulses, not a speed multiplier. `bounce` splits the velocity into
+the part going into the surface and the part sliding along it, reverses the
+first with `RESTITUTION` and keeps most of the second — which is what makes a
+glancing blow deflect the car rather than stop it. Scaling `speed` instead, the
+way this used to, turned every clipped kerb into a full stop. An off-centre hit
+also feeds `yawVel`, so a corner-to-corner clip spins both cars and a square
+rear-ending does not.
+
+The car that gets hit is on rails, so it takes the opposite impulse as
+`VehicleBody.pushX/pushZ/pushSpin` — a velocity it slides on and then recovers
+from, drifting back into lane over a couple of seconds. Measured: about 1.5 m
+out of lane and eased back. Restitution is deliberately low; sheet metal is not
+a superball, and near 1 the street reads like dodgems.
 
 Two traps around it:
 

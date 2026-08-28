@@ -32,6 +32,8 @@ export interface World {
   footprints: Footprint[];
   /** Live pedestrian positions, for the map overlay. */
   crowdPositions(): THREE.Vector3[];
+  /** Every street lamp head, in world space — see `render/lights.ts`. */
+  lamps: THREE.Vector3[];
   /** Shootable pedestrians — see `weapons/ballistics.ts`. Held by reference. */
   people: PersonTarget[];
   /**
@@ -233,6 +235,7 @@ export function buildWorld(): World {
     targets,
     footprints: [...buildings.footprints, ...city.footprints],
     crowdPositions: () => crowd.positions(),
+    lamps: [...buildings.lamps, ...city.lamps],
     people: crowd.people,
     trafficBodies: traffic.bodies,
     panic,

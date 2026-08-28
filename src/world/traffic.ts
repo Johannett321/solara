@@ -39,6 +39,10 @@ interface Vehicle {
   panic: number;
   /** Phase offset so a panicking lane does not weave in unison. */
   wobble: number;
+  /** Lateral displacement from being hit, easing back to the lane. */
+  shoveX: number;
+  /** Extra yaw from being hit, easing back to straight. */
+  shoveSpin: number;
   wheels: THREE.Object3D[];
   wheelR: number;
   /** This car's entry in the culler; `near` is the range rule below. */
@@ -73,6 +77,18 @@ export interface VehicleBody {
   speed: number;
   /** The player is driving it; nothing should collide it with itself. */
   taken: boolean;
+  /**
+   * Impulse from being hit, in m/s, decaying to nothing.
+   *
+   * Written by whoever hit it and consumed by `traffic.update`. A car that has
+   * been shoved slides off its lane and drifts back to it, rather than being
+   * nailed to it while another car bounces off — being hit has to move you or
+   * it does not read as a crash.
+   */
+  pushX: number;
+  pushZ: number;
+  /** Rad/s of spin from an off-centre hit, also decaying. */
+  pushSpin: number;
 }
 
 /** Is `px,pz` inside the body's footprint, grown by `pad`? */
@@ -230,6 +246,9 @@ export function buildTraffic(colliders: Colliders): Traffic {
         halfWidth: carSpec(kind).width * 0.5,
         speed: 0,
         taken: false,
+        pushX: 0,
+        pushZ: 0,
+        pushSpin: 0,
       };
       bodies.push(body);
 
@@ -249,6 +268,8 @@ export function buildTraffic(colliders: Colliders): Traffic {
         cruise: rng.range(7.5, 12.5),
         panic: 0,
         wobble: rng.range(0, Math.PI * 2),
+        shoveX: 0,
+        shoveSpin: 0,
         wheels: build.wheels,
         wheelR: build.spec.wheelR,
       };
@@ -330,17 +351,40 @@ export function buildTraffic(colliders: Colliders): Traffic {
         if (v.z < v.zMin) v.z += span;
         // Follow the surface, so traffic climbs the bridges instead of
         // driving straight through the riverbed.
+        /* ---------------------------------------------------------- shoved */
+
+        // Knocked out of lane by a collision, and recovering. The push is a
+        // velocity that decays; `shoveX` is where it has carried the car so
+        // far, and that in turn eases back to zero once the push has gone.
+        const b = v.body;
+        if (b.pushX !== 0 || b.pushZ !== 0 || b.pushSpin !== 0) {
+          v.shoveX += b.pushX * dt;
+          v.z += b.pushZ * dt;
+          v.shoveSpin += b.pushSpin * dt;
+          const decay = Math.max(0, 1 - 3.2 * dt);
+          b.pushX *= decay;
+          b.pushZ *= decay;
+          b.pushSpin *= decay;
+          if (Math.abs(b.pushX) < 0.05) b.pushX = 0;
+          if (Math.abs(b.pushZ) < 0.05) b.pushZ = 0;
+          if (Math.abs(b.pushSpin) < 0.02) b.pushSpin = 0;
+        }
+        // Pull back into lane and straighten up, but slowly enough to see.
+        v.shoveX -= v.shoveX * Math.min(1, dt * 0.9);
+        v.shoveSpin -= v.shoveSpin * Math.min(1, dt * 1.4);
+
         // Swerve. The wander is driven off `z` rather than a clock so a car
         // weaves along the road instead of shimmying on the spot in traffic.
         const swerve = v.panic * Math.sin(v.z * 0.22 + v.wobble) * 1.35;
-        const x = v.lane + swerve;
+        const x = v.lane + swerve + v.shoveX;
         v.group.position.set(x, v.deckY ?? groundHeight(x, v.z), v.z);
         // Point where it is actually going, so a swerving car leans into it.
         const drift = v.panic * Math.cos(v.z * 0.22 + v.wobble) * 0.3;
-        v.group.rotation.y = (v.dir > 0 ? 0 : Math.PI) + Math.PI / 2 - drift * v.dir;
+        v.group.rotation.y =
+          (v.dir > 0 ? 0 : Math.PI) + Math.PI / 2 - drift * v.dir + v.shoveSpin;
 
         // Keep the body in step with what was just drawn.
-        v.body.yaw = v.dir > 0 ? 0 : Math.PI;
+        v.body.yaw = (v.dir > 0 ? 0 : Math.PI) - v.shoveSpin;
         v.body.speed = v.speed;
 
         // Roll the wheels to match ground speed.
