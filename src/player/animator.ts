@@ -24,6 +24,66 @@ function bump(phase: number, centre: number, width: number): number {
 
 const PI = Math.PI;
 
+/**
+ * Aim pose, in joint angles.
+ *
+ * Split out and mutable so it can be tuned against a screenshot rather than by
+ * arithmetic: the weapon hangs off the wrist through two Euler chains, and
+ * working out by hand which sign puts the barrel on the crosshair is a good way
+ * to spend an afternoon. `window.SOLARA.aimPose` is this object.
+ */
+export const AIM_POSE = {
+  /** Gun arm. `pitch` terms track the camera up and down. */
+  /**
+   * Solved for where the *hand* ends up, not for where the barrel points.
+   *
+   * Optimising the arm angles directly against the aim line finds poses that
+   * are numerically perfect and anatomically absurd — the first solve put the
+   * barrel within a degree of the crosshair with her fist tucked against her
+   * ear. The arm is placed to look like someone holding a gun, and
+   * `GRIP_ROTATION` in `weapons/index.ts` takes up the remaining few degrees.
+   */
+  gunShoulderX: -1.22,
+  /**
+   * Share of the camera pitch the shoulder carries. Positive because
+   * `chase.pitch` is positive looking *down* — the sign here was wrong first
+   * time and made the gun swing away from the crosshair rather than with it.
+   * Residual is under a degree level, ~5 aiming steeply down.
+   */
+  gunShoulderXPitch: 0.95,
+  gunShoulderY: 0.3,
+  gunShoulderZ: 0.25,
+  gunElbowX: -0.5,
+  gunWristX: -0.06,
+  /**
+   * Support arm, two-handed. Solved for the gap between the left hand and the
+   * SMG's `SUPPORT_GRIP`, which is the magazine well rather than the foregrip:
+   * with the gun arm extended, the foregrip sits about 0.72 m from the left
+   * shoulder and the whole arm is 0.545 m, so no pose reaches it. Gripping the
+   * magazine is both a real technique and one she can actually get to. Residual
+   * gap is ~8 cm, which is inside the width of a hand.
+   */
+  supShoulderX: -1.43,
+  supShoulderXPitch: 0.95,
+  supShoulderY: -0.75,
+  supShoulderZ: -0.03,
+  supElbowX: -0.25,
+  /** Support arm, one-handed: tucked in rather than left hanging. */
+  freeShoulderX: -0.42,
+  freeShoulderY: -0.2,
+  freeShoulderZ: 0.16,
+  freeElbowX: -1.15,
+  /** Torso squared up behind the gun. */
+  spineY: -0.12,
+  spineX: -0.06,
+  spineXPitch: -0.12,
+  chestY: -0.16,
+  chestX: -0.04,
+  headXPitch: -0.42,
+  headX: 0.05,
+  headY: 0.1,
+};
+
 export const GAIT = {
   walkSpeed: 1.65,
   runSpeed: 5.1,
@@ -52,6 +112,15 @@ export interface LocomotionState {
   swimming?: boolean;
   /** Water depth underfoot, for the wading blend. */
   depth?: number;
+  /**
+   * 0 carrying, 1 aiming down sights. The gun hangs from the wrist joint, so
+   * the aim pose is what points it — there is no separate weapon animation.
+   */
+  aim?: number;
+  /** Camera pitch, so she actually looks where the crosshair is. */
+  aimPitch?: number;
+  /** Support hand comes across for an SMG, stays clear for a pistol. */
+  twoHanded?: boolean;
 }
 
 interface Link {
@@ -75,6 +144,7 @@ export class MaraAnimator {
   private land = 0;
   private swim = 0;
   private stroke = 0;
+  private aim = 0;
 
   /**
    * Fired the moment a foot plants. Only the player's animator sets this — the
@@ -258,6 +328,14 @@ export class MaraAnimator {
     if (this.land > 0.001) this.poseLanding(this.land);
     if (this.swim > 0.001) this.poseSwim(this.swim, speed);
 
+    // Aiming last of the upper-body layers and before the foot IK: it has to
+    // win over the arm swing, and it must not touch the legs, which keep
+    // walking underneath it.
+    this.aim += ((st.aim ?? 0) - this.aim) * Math.min(1, dt * 12);
+    if (this.aim > 0.002) {
+      this.poseAim(this.aim * (1 - this.swim) * (1 - this.air), st.aimPitch ?? 0, st.twoHanded ?? false);
+    }
+
     /* -------------------------------------------- foot planting (IK) */
 
     // Meaningless while airborne or afloat — the feet are supposed to be off
@@ -289,6 +367,60 @@ export class MaraAnimator {
    * ground. The two legs are deliberately asymmetric — a perfectly mirrored
    * jump reads as a mannequin.
    */
+  /**
+   * Weapon carry and aim.
+   *
+   * `w` runs from carrying (arm down, gun by the hip) at 0 to aiming down the
+   * sights at 1, because there is no third state worth authoring: the moment
+   * she has a gun out the arm stops swinging like an empty one, and pulling it
+   * up to eye line is the same motion carried further.
+   *
+   * `pitch` is the camera's, so the barrel tracks the crosshair up and down a
+   * building rather than staying level. The shoulder carries most of it and the
+   * head a little, which is what stops her looking like she is aiming at her
+   * own feet when the player looks down.
+   */
+  private poseAim(w: number, pitch: number, twoHanded: boolean): void {
+    const r = this.rig;
+    const L = THREE.MathUtils.lerp;
+
+    const A = AIM_POSE;
+
+    // The gun hand. The weapon is parented down the forearm, so where this
+    // points is where the barrel points.
+    r.armR.shoulder.rotation.x = L(r.armR.shoulder.rotation.x, A.gunShoulderX + pitch * A.gunShoulderXPitch, w);
+    r.armR.shoulder.rotation.y = L(r.armR.shoulder.rotation.y, A.gunShoulderY, w);
+    r.armR.shoulder.rotation.z = L(r.armR.shoulder.rotation.z, A.gunShoulderZ, w);
+    r.armR.elbow.rotation.x = L(r.armR.elbow.rotation.x, A.gunElbowX, w);
+    r.armR.elbow.rotation.y = L(r.armR.elbow.rotation.y, 0, w);
+    r.armR.wrist.rotation.x = L(r.armR.wrist.rotation.x, A.gunWristX, w);
+    r.armR.wrist.rotation.z = L(r.armR.wrist.rotation.z, 0, w);
+
+    // The support hand. On a two-handed weapon it comes across to meet the
+    // foregrip; on a pistol it tucks in rather than hanging, which reads as
+    // braced instead of forgotten.
+    r.armL.shoulder.rotation.x = L(
+      r.armL.shoulder.rotation.x,
+      twoHanded ? A.supShoulderX + pitch * A.supShoulderXPitch : A.freeShoulderX,
+      w,
+    );
+    r.armL.shoulder.rotation.y = L(r.armL.shoulder.rotation.y, twoHanded ? A.supShoulderY : A.freeShoulderY, w);
+    r.armL.shoulder.rotation.z = L(r.armL.shoulder.rotation.z, twoHanded ? A.supShoulderZ : A.freeShoulderZ, w);
+    r.armL.elbow.rotation.x = L(r.armL.elbow.rotation.x, twoHanded ? A.supElbowX : A.freeElbowX, w);
+
+    // Square the torso up behind the gun and kill the walk sway, which reads as
+    // wobble the moment there is a barrel to notice it on.
+    r.spine.rotation.y = L(r.spine.rotation.y, A.spineY, w);
+    r.spine.rotation.x = L(r.spine.rotation.x, A.spineX + pitch * A.spineXPitch, w);
+    r.chest.rotation.y = L(r.chest.rotation.y, A.chestY, w);
+    r.chest.rotation.x = L(r.chest.rotation.x, A.chestX, w);
+
+    // Head down the sights, not off on an idle glance.
+    r.head.rotation.x = L(r.head.rotation.x, pitch * A.headXPitch + A.headX, w);
+    r.head.rotation.y = L(r.head.rotation.y, A.headY, w);
+    r.head.rotation.z = L(r.head.rotation.z, 0, w);
+  }
+
   private poseAir(vy: number, w: number): void {
     const r = this.rig;
     // +1 rising hard, -1 falling hard.

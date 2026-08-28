@@ -53,6 +53,51 @@
         padding: 1px 6px; margin-right: 8px; font-weight: 800;
       }
 
+      /* Crosshair. Four ticks around a gap that widens with the shot cone, so
+         the reticle is a live readout of accuracy rather than decoration. */
+      #reticle {
+        position: absolute; left: 50%; top: 50%;
+        width: 0; height: 0; opacity: 0;
+        transition: opacity .16s ease;
+      }
+      #reticle.show { opacity: .9; }
+      #reticle i {
+        position: absolute; display: block; background: #fff;
+        box-shadow: 0 0 3px rgba(0,0,0,.9);
+        transform-origin: 50% 50%;
+      }
+      #reticle .v { width: 2px; height: 9px; left: -1px; }
+      #reticle .h { height: 2px; width: 9px; top: -1px; }
+      #reticle .dot {
+        width: 2px; height: 2px; left: -1px; top: -1px;
+        border-radius: 50%; opacity: .8;
+      }
+
+      /* Ammo counter, bottom-right above the speedo slot */
+      #ammo {
+        position: absolute; right: 40px; bottom: 40px; text-align: right;
+        color: #fff; opacity: 0; transition: opacity .25s ease;
+        font-variant-numeric: tabular-nums;
+      }
+      #ammo.show { opacity: .95; }
+      #ammo .mag { font-size: 42px; font-weight: 800; line-height: 1; letter-spacing: .02em; }
+      #ammo .mag.empty { color: #ff6b6b; }
+      #ammo .reserve { font-size: 15px; font-weight: 600; opacity: .6; margin-left: 6px; }
+      #ammo .name {
+        font-size: 10px; letter-spacing: .22em; text-transform: uppercase;
+        opacity: .6; margin-top: 5px;
+      }
+      #ammo .reloading { color: #ffd24a; }
+
+      /* Weapon wheel */
+      #wheel {
+        position: fixed; inset: 0; pointer-events: none; z-index: 6;
+        opacity: 0; transition: opacity .12s ease;
+        background: rgba(6,8,12,.28); backdrop-filter: blur(2px);
+      }
+      #wheel.show { opacity: 1; }
+      #wheel canvas { position: absolute; inset: 0; }
+
       /* Speedometer */
       #speedo {
         position: absolute; right: 40px; bottom: 40px; text-align: right;
@@ -152,7 +197,18 @@
       <div id="stats"></div>
       <div id="prompt"><b>F</b><span id="promptText">Enter vehicle</span></div>
       <div id="speedo"><div class="kph">0</div><div class="unit">KM/H</div></div>
+      <div id="reticle">
+        <i class="v" id="rT"></i><i class="v" id="rB"></i>
+        <i class="h" id="rL"></i><i class="h" id="rR"></i>
+        <i class="dot"></i>
+      </div>
+      <div id="ammo">
+        <div><span class="mag" id="ammoMag">12</span><span class="reserve" id="ammoReserve">/ 48</span></div>
+        <div class="name" id="ammoName">Sidearm</div>
+      </div>
     </div>
+
+    <div id="wheel"><canvas id="wheelCanvas"></canvas></div>
 
     <div id="map">
       <header>
@@ -183,6 +239,9 @@
           <span><kbd>Space</kbd></span><span>Jump &middot; handbrake</span>
           <span><kbd>Shift</kbd></span><span>Sprint</span>
           <span><kbd>F</kbd></span><span>Enter / exit vehicle &middot; boat</span>
+          <span><kbd>Tab</kbd></span><span>Hold for weapon wheel</span>
+          <span><kbd>RMB</kbd></span><span>Aim &middot; <kbd>LMB</kbd> fire</span>
+          <span><kbd>R</kbd></span><span>Reload</span>
           <span><kbd>Mouse</kbd></span><span>Look around</span>
           <span><kbd>Esc</kbd></span><span>Map</span>
           <span><kbd>N</kbd></span><span>Mute</span>

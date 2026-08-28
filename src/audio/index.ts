@@ -3,6 +3,7 @@ import { AudioCore } from './core';
 import { Ambience } from './ambience';
 import { PlayerAudio, Surface } from './player';
 import { MachineAudio } from './machines';
+import { WeaponAudio } from './weapons';
 import {
   SHORELINE_X,
   PARK_EDGE,
@@ -51,6 +52,10 @@ export class Audio {
   private ambience: Ambience;
   private playerFx: PlayerAudio;
   private machines: MachineAudio;
+  private weapons: WeaponAudio;
+  /** Camera basis for panning gunfire, refreshed once a frame by `update`. */
+  private listener = new THREE.Vector3();
+  private listenerRight = new THREE.Vector3();
 
   /** Crowd counting is O(n) over ~150 agents; no need to do it every frame. */
   private crowdTimer = 0;
@@ -62,6 +67,7 @@ export class Audio {
     this.ambience = new Ambience(this.core);
     this.playerFx = new PlayerAudio(this.core);
     this.machines = new MachineAudio(this.core);
+    this.weapons = new WeaponAudio(this.core);
   }
 
   unlock(): void {
@@ -89,6 +95,45 @@ export class Audio {
   step(pos: THREE.Vector3, effort: number): void {
     if (!this.core.running) return;
     this.playerFx.step(this.surfaceAt(pos.x, pos.z), effort);
+  }
+
+  /* ------------------------------------------------------------- weapons */
+
+  /**
+   * Pan and attenuate a world point against the camera basis `update` cached.
+   *
+   * Gunfire is the only thing in the game loud enough that a shot fired behind
+   * the camera has to be audibly behind it, so unlike the footsteps it is
+   * placed rather than played flat.
+   */
+  private place(pos: THREE.Vector3): { pan: number; gain: number } {
+    const dx = pos.x - this.listener.x;
+    const dy = pos.y - this.listener.y;
+    const dz = pos.z - this.listener.z;
+    const dist = Math.hypot(dx, dy, dz);
+    if (dist < 1e-3) return { pan: 0, gain: 1 };
+    const pan = (dx * this.listenerRight.x + dz * this.listenerRight.z) / dist;
+    // Inverse falloff with a floor, so a shot across the street still lands.
+    return { pan: Math.max(-1, Math.min(1, pan)), gain: 1 / (1 + dist * dist * 0.004) };
+  }
+
+  /** @param body Report centre frequency — a pistol barks higher than an SMG. */
+  shot(pos: THREE.Vector3, body: number, level: number): void {
+    const { pan, gain } = this.place(pos);
+    this.weapons.shot(body, level * gain, pan);
+  }
+
+  bulletImpact(kind: 'ground' | 'wall' | 'person' | 'vehicle', pos: THREE.Vector3): void {
+    const { pan, gain } = this.place(pos);
+    this.weapons.impact(kind, gain, pan);
+  }
+
+  dryFire(): void {
+    this.weapons.dryFire();
+  }
+
+  reload(duration: number): void {
+    this.weapons.reload(duration);
   }
 
   /** Thunder from a strike `distance` metres away; the delay is the giveaway. */
@@ -137,6 +182,11 @@ export class Audio {
 
   update(dt: number, f: AudioFrame): void {
     if (!this.core.running) return;
+
+    // Cached for `place` — gunfire can be fired from anywhere in the frame,
+    // including from callbacks that run before this one on the next tick.
+    this.listener.copy(f.listener);
+    this.listenerRight.copy(f.right);
 
     /* ------------------------------------------------------- listener */
 

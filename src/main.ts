@@ -5,13 +5,15 @@ import { buildWeather } from './render/weather';
 import { buildPost } from './render/post';
 import { buildWorld } from './world';
 import { buildMara } from './player/rig';
-import { MaraAnimator, GAIT } from './player/animator';
+import { MaraAnimator, GAIT, AIM_POSE } from './player/animator';
 import { Controller } from './player/controller';
 import { VehicleController } from './player/driving';
 import { BoatController } from './player/boating';
 import { ThirdPersonCamera, ON_FOOT, IN_CAR, inBoat } from './camera/thirdperson';
 import { Input } from './core/input';
 import { MapOverlay } from './ui/map';
+import { WeaponWheel } from './ui/weaponwheel';
+import { Arsenal, WeaponId } from './weapons';
 import { Audio } from './audio';
 import { groundHeight, waterDepth, SPAWN } from './world/layout';
 import type { Drivable } from './world/cars';
@@ -77,6 +79,40 @@ rig.root.position.copy(controller.position);
 rig.root.rotation.y = controller.yaw;
 chase.setRig(ON_FOOT);
 chase.reset(controller.position, SPAWN.yaw);
+
+/* --------------------------------------------------------------- weapons */
+
+// Recoil goes to the camera, not to the arm: kicking the look angles moves the
+// crosshair, which is the thing the player is actually aiming with. Kicking
+// only the gun would look right and shoot identically, which is worse.
+const arsenal = new Arsenal(rig, world.colliders, {
+  onRecoil: (pitch, yaw) => chase.kick(pitch, yaw),
+  onShot: (spec, muzzle) => audio.shot(muzzle, spec.twoHanded ? 150 : 200, 0.85),
+  onHit: (kind, point) => {
+    if (kind !== 'sky') audio.bulletImpact(kind, point);
+  },
+  onDryFire: () => audio.dryFire(),
+  onReload: (spec) => audio.reload(spec.reloadTime),
+});
+scene.add(arsenal.fx.group);
+
+// Both weapons to start with. When the gun shops land, this becomes whatever
+// the player has actually bought — `give` is the only way in either way.
+arsenal.give('pistol');
+arsenal.give('smg');
+
+const wheel = new WeaponWheel(
+  document.getElementById('wheel')!,
+  document.getElementById('wheelCanvas') as HTMLCanvasElement,
+  {
+    has: (id) => arsenal.has(id),
+    ammoOf: (id) => arsenal.ammoOf(id),
+    current: () => arsenal.current,
+  },
+);
+
+/** Re-drawn on getting out of a car, so the gun survives a drive. */
+let stowed: WeaponId | null = null;
 
 const post = buildPost(renderer, scene, camera);
 post.setSize(innerWidth, innerHeight, Math.min(devicePixelRatio, 1.75));
@@ -153,6 +189,17 @@ const promptEl = document.getElementById('prompt')!;
 const promptText = document.getElementById('promptText')!;
 const speedoEl = document.getElementById('speedo')!;
 const speedoKph = speedoEl.querySelector('.kph') as HTMLElement;
+const reticleEl = document.getElementById('reticle')!;
+const reticle = {
+  top: document.getElementById('rT') as HTMLElement,
+  bottom: document.getElementById('rB') as HTMLElement,
+  left: document.getElementById('rL') as HTMLElement,
+  right: document.getElementById('rR') as HTMLElement,
+};
+const ammoEl = document.getElementById('ammo')!;
+const ammoMag = document.getElementById('ammoMag') as HTMLElement;
+const ammoReserve = document.getElementById('ammoReserve') as HTMLElement;
+const ammoName = document.getElementById('ammoName') as HTMLElement;
 
 /* ------------------------------------------------------------ game state */
 
@@ -282,8 +329,24 @@ function nearestBoat(): Boat | null {
   return best;
 }
 
+/** Put the gun away for a drive, remembering what was drawn. */
+function stow(): void {
+  stowed = arsenal.current;
+  arsenal.holster();
+  chase.setAim(false);
+  controller.faceYaw = null;
+  wheel.closeWheel();
+}
+
+/** And draw it again on the pavement. */
+function redraw(): void {
+  if (stowed) arsenal.equip(stowed);
+  stowed = null;
+}
+
 function enterBoat(b: Boat): void {
   audio.enterBoat();
+  stow();
   boat.enter(b);
   mode = 'boating';
   rig.root.visible = false;
@@ -306,11 +369,13 @@ function exitBoat(): void {
   chase.setRig(ON_FOOT, controller.position);
   chase.setAutoAlign(null);
   speedoEl.classList.remove('show');
+  redraw();
   input.clearBuffers();
 }
 
 function enterCar(car: Drivable): void {
   audio.enterCar();
+  stow();
   vehicle.enter(car);
   mode = 'driving';
   rig.root.visible = false;
@@ -336,6 +401,7 @@ function exitCar(): void {
   chase.setRig(ON_FOOT, controller.position);
   chase.setAutoAlign(null);
   speedoEl.classList.remove('show');
+  redraw();
   // Space is the handbrake in a car; don't let a held press become a jump.
   input.clearBuffers();
 }
@@ -350,6 +416,7 @@ addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
   post.setSize(innerWidth, innerHeight, dpr);
   mapUI.resize();
+  wheel.resize();
 });
 
 renderer.domElement.addEventListener('click', () => {
@@ -375,6 +442,12 @@ renderer.domElement.addEventListener('click', () => {
   post,
   mapUI,
   audio,
+  arsenal,
+  wheel,
+  aimPose: AIM_POSE,
+  // Under automation pointer lock is never really held, so `Input` ignores
+  // every mouse event. Driving the weapons from a script means forcing this.
+  input,
   getMode: () => mode,
   enterNearestCar: () => {
     const c = nearestCar();
@@ -386,7 +459,39 @@ renderer.domElement.addEventListener('click', () => {
 /* ------------------------------------------------------------------ loop */
 
 const cameraRight = new THREE.Vector3();
+const aimDir = new THREE.Vector3();
 const shadowVolume = new THREE.Frustum();
+
+/**
+ * Crosshair and ammo.
+ *
+ * The reticle gap is driven from the same `spreadNow` the bullets are, rather
+ * than from an animation: a crosshair that does not match the cone it is
+ * standing in front of is worse than no crosshair at all.
+ */
+function updateWeaponHud(aiming: boolean): void {
+  const spec = arsenal.spec;
+  if (!spec) {
+    reticleEl.classList.remove('show');
+    ammoEl.classList.remove('show');
+    return;
+  }
+  reticleEl.classList.add('show');
+  ammoEl.classList.add('show');
+
+  const gap = 4 + arsenal.spread01(aiming, controller.speed) * 24;
+  reticle.top.style.top = `${-(gap + 9)}px`;
+  reticle.bottom.style.top = `${gap}px`;
+  reticle.left.style.left = `${-(gap + 9)}px`;
+  reticle.right.style.left = `${gap}px`;
+
+  const { mag, reserve } = arsenal.ammoOf(spec.id);
+  ammoMag.textContent = String(mag);
+  ammoMag.classList.toggle('empty', mag === 0);
+  ammoReserve.textContent = `/ ${reserve}`;
+  ammoName.textContent = arsenal.isReloading ? 'Reloading' : spec.name;
+  ammoName.classList.toggle('reloading', arsenal.isReloading);
+}
 const clock = new THREE.Clock();
 let fpsAccum = 0;
 let fpsFrames = 0;
@@ -443,6 +548,28 @@ function frame(): void {
       chase.update(dt, vehicle.position, Math.abs(vehicle.speed), 34);
       speedoKph.textContent = String(Math.round(vehicle.kph));
     } else {
+      /* -------------------------------------------------------- weapons */
+
+      // The wheel eats the frame's pointer delta before the camera can. Both
+      // read the same buffer and `takeMouse` clears it, so draining it here is
+      // what stops the view swinging around while a weapon is being picked.
+      if (input.wheel && !arsenal.isReloading) {
+        if (!wheel.isOpen) wheel.openWheel();
+        const m = input.takeMouse();
+        wheel.moveCursor(m.x, m.y);
+      } else if (wheel.isOpen) {
+        // Releasing Tab commits whatever the cursor was pointing at.
+        arsenal.equip(wheel.selection);
+        wheel.closeWheel();
+      }
+
+      const spec = arsenal.spec;
+      // No aiming with empty hands, and none while the wheel is up.
+      const aiming = !!spec && input.aiming && !wheel.isOpen;
+      chase.setAim(aiming, spec ? spec.adsFov : 40);
+      // Hold the camera's heading and strafe around it while aiming.
+      controller.faceYaw = aiming ? chase.yaw : null;
+
       controller.update(dt, chase.yaw);
 
       rig.root.position.copy(controller.position);
@@ -458,14 +585,47 @@ function frame(): void {
         justLanded: controller.justLanded,
         swimming: controller.swimming,
         depth: controller.depth,
+        // Carry the gun as soon as it is drawn; raise it to the eye on aim.
+        aim: spec ? 0.34 + chase.aim01 * 0.66 : 0,
+        aimPitch: chase.pitch,
+        twoHanded: spec ? spec.twoHanded : false,
       });
 
       chase.update(dt, controller.position, controller.speed, GAIT.runSpeed);
+
+      // After the camera has settled, so the round goes where the crosshair is
+      // *this* frame rather than where it was last frame.
+      if (spec && !wheel.isOpen) {
+        camera.getWorldDirection(aimDir);
+        arsenal.update(dt, {
+          aiming,
+          firing: input.firing,
+          fireEdge: input.takeFire(),
+          reload: input.takeReload(),
+          eye: camera.position,
+          look: aimDir,
+          speed: controller.speed,
+          targets: { people: world.crowdPositions(), vehicles: world.targets },
+        });
+      } else {
+        // Still tick the effects: tracers and puffs have to finish fading even
+        // with the gun put away.
+        arsenal.fx.update(dt);
+        input.takeFire();
+        input.takeReload();
+      }
+      updateWeaponHud(aiming);
 
       if (controller.justJumped) audio.jump();
       if (controller.justLanded) {
         audio.land(controller.position, THREE.MathUtils.clamp(-controller.vy / 6 + 0.5, 0.3, 1));
       }
+    }
+
+    if (mode !== 'onFoot') {
+      arsenal.fx.update(dt);
+      reticleEl.classList.remove('show');
+      ammoEl.classList.remove('show');
     }
 
     if (mode === 'driving' && vehicle.impact > 0.05) audio.impact(vehicle.impact);
@@ -496,6 +656,7 @@ function frame(): void {
     updatePrompt();
   }
 
+  wheel.update(dt);
   world.update(t, dt, focus);
   weather.update(dt, camera.position);
   sky.update(dt, camera.position);

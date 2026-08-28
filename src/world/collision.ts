@@ -169,6 +169,19 @@ export class Colliders {
     return len;
   }
 
+  /**
+   * Is this point inside anything solid?
+   *
+   * `raycastXZ` above walks at a fixed 25 cm and is O(colliders) per step,
+   * which is right for one camera arm per frame and far too expensive for a
+   * bullet: a 160 m shot would be 640 steps over a few thousand colliders, a
+   * dozen times a second. Ballistics marches at its own adaptive step instead
+   * and asks this directly — see `weapons/ballistics.ts`.
+   */
+  hits(x: number, z: number, y: number): boolean {
+    return this.blocked(x, z, y, 0);
+  }
+
   private blocked(x: number, z: number, y: number, pad: number): boolean {
     for (const b of this.boxes) {
       if (!b.on || y >= b.top) continue;

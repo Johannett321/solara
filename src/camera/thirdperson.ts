@@ -52,6 +52,24 @@ export const IN_CAR: RigPreset = {
   fov: 60,
 };
 
+/**
+ * Aim-down-sights rig.
+ *
+ * Pulling in and swinging the pivot to the right is what makes it read as
+ * over-the-shoulder rather than just zoomed: the character has to move *off*
+ * centre, or the thing you are trying to shoot stays hidden behind her head.
+ */
+const ADS = {
+  /** Metres the pivot slides along the camera's right vector. */
+  shoulder: 0.62,
+  /** Camera arm length while aiming. */
+  distance: 1.95,
+  /** Lifted, so the sight line sits nearer the eye than the sternum. */
+  pivotLift: 0.14,
+  /** How fast the whole thing eases in and out, per second. */
+  ease: 9,
+} as const;
+
 export class ThirdPersonCamera {
   yaw = Math.PI;
   pitch = THREE.MathUtils.degToRad(8);
@@ -61,6 +79,11 @@ export class ThirdPersonCamera {
   private pivot = new THREE.Vector3();
   private currentDist = 4.1;
   private baseFov: number;
+  /** Eased 0..1 aim weight; the FOV to reach at 1. */
+  private aim = 0;
+  private aimWanted = false;
+  private aimFov = 40;
+  private right = new THREE.Vector3();
   /** Set while driving so the camera drifts back behind the car. */
   private alignYaw: number | null = null;
   private alignStrength = 0;
@@ -97,6 +120,28 @@ export class ThirdPersonCamera {
     this.alignStrength = strength;
   }
 
+  /**
+   * Aim down sights.
+   *
+   * @param fov Field of view at full aim — per weapon, so a pistol and an SMG
+   *   pull in by different amounts.
+   */
+  setAim(on: boolean, fov = 40): void {
+    this.aimWanted = on;
+    this.aimFov = fov;
+  }
+
+  /** Eased aim weight, so the crosshair and the animator agree with the view. */
+  get aim01(): number {
+    return this.aim;
+  }
+
+  /** Add camera kick. Recoil is applied to the look angles, not the arm. */
+  kick(pitch: number, yaw: number): void {
+    this.pitch = THREE.MathUtils.clamp(this.pitch - pitch, MIN_PITCH, MAX_PITCH);
+    this.yaw += yaw;
+  }
+
   /** Snap behind the subject, used on spawn and when getting in or out. */
   reset(target: THREE.Vector3, yaw: number): void {
     this.yaw = yaw;
@@ -106,8 +151,12 @@ export class ThirdPersonCamera {
   }
 
   update(dt: number, target: THREE.Vector3, speed: number, maxSpeed: number): void {
+    this.aim += ((this.aimWanted ? 1 : 0) - this.aim) * Math.min(1, dt * ADS.ease);
+
     const m = this.input.takeMouse();
-    const sens = 0.0022;
+    // Slower look while aiming, in proportion to the zoom: the same hand
+    // movement has to cover fewer degrees or fine aim is impossible.
+    const sens = 0.0022 * (1 - this.aim * 0.45);
     this.yaw -= m.x * sens;
     this.pitch = THREE.MathUtils.clamp(this.pitch + m.y * sens, MIN_PITCH, MAX_PITCH);
 
@@ -120,8 +169,14 @@ export class ThirdPersonCamera {
       this.yaw += delta * Math.min(1, this.alignStrength * dt);
     }
 
-    this.tmp.set(0, this.rig.pivotHeight, 0);
+    this.tmp.set(0, this.rig.pivotHeight + ADS.pivotLift * this.aim, 0);
     const goal = this.tmp.add(target);
+    // Slide the follow point over the character's shoulder. Camera right is
+    // (cos yaw, -sin yaw) for a yaw measured as (sin, cos) forward.
+    if (this.aim > 0.001) {
+      this.right.set(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
+      goal.addScaledVector(this.right, ADS.shoulder * this.aim);
+    }
     // Damped follow gives a touch of lag without ever feeling loose.
     const f = this.rig.follow;
     this.pivot.x = THREE.MathUtils.damp(this.pivot.x, goal.x, f, dt);
@@ -132,8 +187,10 @@ export class ThirdPersonCamera {
   }
 
   private apply(dt: number, speed01: number): void {
-    // Pull back a little at speed for a sense of acceleration.
-    const wanted = this.distance + speed01 * 0.85;
+    // Pull back a little at speed for a sense of acceleration — but not while
+    // aiming, where the arm length is the whole point.
+    const hip = this.distance + speed01 * 0.85;
+    const wanted = THREE.MathUtils.lerp(hip, ADS.distance, this.aim);
 
     // `yaw` is the direction the camera LOOKS; the rig sits opposite it, behind
     // the character. Same convention the controller uses to build move vectors.
@@ -169,7 +226,7 @@ export class ThirdPersonCamera {
       .addScaledVector(new THREE.Vector3(Math.sin(this.yaw), 0, Math.cos(this.yaw)), 0.6);
     this.camera.lookAt(this.lookAt);
 
-    const fov = this.baseFov + speed01 * 6.5;
+    const fov = THREE.MathUtils.lerp(this.baseFov + speed01 * 6.5, this.aimFov, this.aim);
     if (Math.abs(this.camera.fov - fov) > 0.01) {
       this.camera.fov = dt > 0 ? THREE.MathUtils.damp(this.camera.fov, fov, 5, dt) : fov;
       this.camera.updateProjectionMatrix();

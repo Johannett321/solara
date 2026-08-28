@@ -5,6 +5,10 @@ export class Input {
   private my = 0;
   private jumpQueued = false;
   private interactQueued = false;
+  private reloadQueued = false;
+  /** Mouse buttons currently held, by `MouseEvent.button`. */
+  private buttons = new Set<number>();
+  private fireQueued = false;
   locked = false;
 
   constructor(private canvas: HTMLElement) {
@@ -13,16 +17,24 @@ export class Input {
     addEventListener('blur', this.onBlur);
     document.addEventListener('pointerlockchange', this.onLockChange);
     document.addEventListener('mousemove', this.onMouseMove);
+    document.addEventListener('mousedown', this.onMouseDown);
+    // Up on the window, not the canvas: releasing outside the page would
+    // otherwise leave the button stuck down and the gun firing forever.
+    addEventListener('mouseup', this.onMouseUp);
+    // Right-drag is aim-down-sights, so the browser menu has to go.
+    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   }
 
   private onKeyDown = (e: KeyboardEvent) => {
     // Queue on the keydown edge only, so auto-repeat can't bunny-hop.
     if (e.code === 'Space' && !e.repeat) this.jumpQueued = true;
     if (e.code === 'KeyF' && !e.repeat) this.interactQueued = true;
+    if (e.code === 'KeyR' && !e.repeat) this.reloadQueued = true;
     this.keys.add(e.code);
-    // Stop the page scrolling out from under the game.
+    // Stop the page scrolling out from under the game — and stop Tab walking
+    // the focus ring through the HUD while the weapon wheel is open.
     if (
-      ['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)
+      ['Space', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)
     )
       e.preventDefault();
   };
@@ -31,18 +43,34 @@ export class Input {
 
   private onBlur = () => {
     this.keys.clear();
+    this.buttons.clear();
     this.clearBuffers();
   };
 
   private onLockChange = () => {
     this.locked = document.pointerLockElement === this.canvas;
-    if (!this.locked) this.keys.clear();
+    if (!this.locked) {
+      this.keys.clear();
+      this.buttons.clear();
+    }
   };
 
   private onMouseMove = (e: MouseEvent) => {
     if (!this.locked) return;
     this.mx += e.movementX;
     this.my += e.movementY;
+  };
+
+  private onMouseDown = (e: MouseEvent) => {
+    // Only once the pointer is captured; the first click is what asks for the
+    // lock in the first place and must not also fire a round.
+    if (!this.locked) return;
+    this.buttons.add(e.button);
+    if (e.button === 0) this.fireQueued = true;
+  };
+
+  private onMouseUp = (e: MouseEvent) => {
+    this.buttons.delete(e.button);
   };
 
   requestLock(): void {
@@ -113,6 +141,42 @@ export class Input {
   clearBuffers(): void {
     this.jumpQueued = false;
     this.interactQueued = false;
+    this.reloadQueued = false;
+    this.fireQueued = false;
+  }
+
+  /* ------------------------------------------------------------- weapons */
+
+  /** Left mouse held. Automatics read this; semi-autos read `takeFire`. */
+  get firing(): boolean {
+    return this.buttons.has(0);
+  }
+
+  /**
+   * Edge-triggered left mouse, so a pistol fires once per click however long
+   * the button is held. Consumed on read.
+   */
+  takeFire(): boolean {
+    if (!this.fireQueued) return false;
+    this.fireQueued = false;
+    return true;
+  }
+
+  /** Right mouse held: aim down sights. */
+  get aiming(): boolean {
+    return this.buttons.has(2);
+  }
+
+  /** Tab held: the weapon wheel is up. */
+  get wheel(): boolean {
+    return this.down('Tab');
+  }
+
+  /** Edge-triggered R. */
+  takeReload(): boolean {
+    if (!this.reloadQueued) return false;
+    this.reloadQueued = false;
+    return true;
   }
 
   get sprint(): boolean {

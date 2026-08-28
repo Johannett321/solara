@@ -30,6 +30,15 @@ export interface World {
   footprints: Footprint[];
   /** Live pedestrian positions, for the map overlay. */
   crowdPositions(): THREE.Vector3[];
+  /**
+   * Everything a bullet can hit that is not the ground or a collider: parked
+   * cars, moving traffic and moored boats.
+   *
+   * Built once and held by reference — every `position` here is the live vector
+   * its owner is already writing each frame, so the array never needs
+   * rebuilding and `weapons/ballistics.ts` can walk it allocation-free.
+   */
+  targets: Array<{ position: THREE.Vector3; radius: number }>;
   /** Wave-displaced sea surface height, for swimmers and boats. */
   waterHeight(x: number, z: number): number;
   /** 0 by day, 1 at full night. Switches on every artificial light. */
@@ -181,11 +190,19 @@ export function buildWorld(): World {
   }
   freezeMatrices(terrain.group);
 
+  const targets: Array<{ position: THREE.Vector3; radius: number }> = [];
+  // The rendered transform, not the logical one: a car being driven moves its
+  // group every frame and only writes `Drivable.position` back on exit.
+  for (const d of cars.drivables) targets.push({ position: d.build.group.position, radius: 1.15 });
+  for (const c of traffic.cullable) targets.push({ position: c.object.position, radius: 1.15 });
+  for (const b of boats.boats) targets.push({ position: b.build.group.position, radius: 1.6 });
+
   return {
     group,
     colliders,
     drivables: cars.drivables,
     boats: boats.boats,
+    targets,
     footprints: [...buildings.footprints, ...city.footprints],
     crowdPositions: () => crowd.positions(),
     waterHeight: (x, z) => ocean.heightAt(x, z),

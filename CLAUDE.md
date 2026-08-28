@@ -456,12 +456,98 @@ the time of day and the weather reach the world's materials.
 
 Keys beyond movement: `M`/`Esc` map, `N` mute, `,`/`.` scrub an hour, `T` freeze
 the clock, `K` step the weather fronts, `J` hand the weather back to the
-simulation.
+simulation. Hold `Tab` for the weapon wheel, right mouse to aim, left mouse to
+fire, `R` to reload.
 
 All locomotion is procedural; there is not a single animation clip in the
 project. `player/animator.ts` evaluates every joint angle per frame from a gait
 phase that advances with **distance actually travelled**, which is why the feet
 never skate.
+
+### Weapons
+
+`weapons/` is the whole system: `specs.ts` is the data, `models.ts` builds the
+geometry, `ballistics.ts` decides what a round hits, `fx.ts` draws it, and
+`index.ts` (`Arsenal`) owns the inventory and the trigger. `ui/weaponwheel.ts`
+is the hold-`Tab` wheel. Adding a weapon is a row in `WEAPONS` plus a builder —
+the wheel, the HUD, the aim pose and the firing code all read the table.
+
+**Rounds start at the camera, not at the muzzle.** The trace runs from the eye
+along `camera.getWorldDirection()`, and the tracer is then drawn from the muzzle
+to wherever that trace ended. Firing from the barrel is the obvious thing to do,
+looks correct in a screenshot, and feels broken in the hand: the gun sits half a
+metre right of the eye, so everything inside about five metres misses low and
+left of the crosshair.
+
+**Nothing raycasts the scene graph.** The world is a few hundred merged meshes
+holding 14M triangles with no BVH, so `THREE.Raycaster` against it would cost
+more than the whole frame. Bullets test the same things the physics does —
+`groundHeight`, the collider set, and the agents' own positions — which is also
+why a bullet can never disagree with what the player can walk into. Pedestrians
+and vehicles are closed-form ray/sphere tests (stepping the ray and testing 424
+pedestrians per step is four orders of magnitude more work); the ground and the
+colliders are marched, finely close in and coarsely far out. `Colliders.hits` 
+exists for this: `raycastXZ` walks at a fixed 25 cm and is O(colliders) per
+step, which is fine for one camera arm per frame and hopeless twelve times a
+second.
+
+#### The aim pose is solved, not authored
+
+The weapon hangs off `armR.wrist`, so where the forearm points is where the
+barrel points, through two Euler chains. Deriving that by hand is a bad way to
+spend an afternoon, so both halves were measured in the running game and the
+numbers baked back in — `AIM_POSE` in `player/animator.ts` is exported and
+mutable (`window.SOLARA.aimPose`) precisely so it can be re-solved.
+
+The order matters, and getting it backwards is the trap:
+
+1. **Solve the arm for where the *hand* ends up.** Optimising the joint angles
+   directly against the aim line finds poses that are numerically perfect and
+   anatomically absurd — the first pass put the barrel within a degree of the
+   crosshair with her fist tucked against her ear.
+2. **Then solve `GRIP_ROTATION` for the barrel**, by asking for the quaternion
+   taking the model's -Z to `camera.getWorldDirection()` in wrist space. It
+   takes up the few degrees the arm pose leaves over.
+
+Three things that were wrong first time:
+
+- **`chase.pitch` is positive looking *down*.** The shoulder's share of the
+  camera pitch has to be positive to follow it; negated, the gun swings away
+  from the crosshair as you look down.
+- **Aim at the shot direction, not at the character's facing.** Over the
+  shoulder the camera looks slightly inward, and a barrel aligned to the body
+  sits visibly off the crosshair.
+- **The support hand cannot reach a foregrip.** With the gun arm extended the
+  SMG's foregrip ends up ~0.72 m from the left shoulder and the whole arm is
+  0.545 m. `SUPPORT_GRIP` is the magazine well instead, which is both reachable
+  and a real technique.
+
+#### Feel
+
+- The crosshair gap is driven from the same `spreadNow` the bullets are. A
+  reticle that lies about the cone it stands in front of is worse than none.
+- **Spread recovery has to be well under `spreadPerShot × rounds per second`.**
+  The SMG first shipped recovering 0.11/s against 0.1125/s of bloom at 750 rpm;
+  the two cancelled and the reticle sat still through a whole magazine.
+- Recoil kicks the *camera*, not the arm. Kicking the gun would look right and
+  shoot identically, which is worse — the player aims with the crosshair.
+- Aiming turns locomotion inside out: `Controller.faceYaw` holds the camera's
+  heading and she strafes around it, because a gun that swings to point wherever
+  the feet are going cannot be aimed.
+- Muzzle flashes are deliberately authored *above* the bloom threshold, unlike
+  the neon in `world/facades.ts` which sits below it. A muzzle flash is the one
+  thing in the world that is meant to smear.
+
+#### Ready for the gun shops
+
+`Arsenal` keeps `owned`, magazines and reserves behind `give`, `addAmmo`, `has`
+and `ammoOf`. The wheel and the HUD only ever read. A shop calls `give(id)` and
+the weapon appears on the wheel; nothing else has to change. `main.ts` currently
+grants both at startup — that call is the placeholder.
+
+**Testing any of this needs `window.SOLARA.input.locked = true`.** Pointer lock
+is stubbed out under automation (see the top of this file), so `Input` ignores
+every mouse event and neither aiming nor firing does anything.
 
 ### Post-processing
 

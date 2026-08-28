@@ -50,6 +50,15 @@ export class Controller {
   /** Set for the one frame a jump launches. */
   justJumped = false;
 
+  /**
+   * Face this heading instead of the direction of travel.
+   *
+   * Aiming turns the locomotion inside out: she holds the camera's heading and
+   * strafes around it, because a gun that swings to point wherever the feet are
+   * going cannot be aimed. Null restores the normal turn-into-your-run.
+   */
+  faceYaw: number | null = null;
+
   /** True once the water is deep enough to be out of her depth. */
   swimming = false;
   /** Depth of water underfoot, so the animator can wade convincingly. */
@@ -125,7 +134,16 @@ export class Controller {
     /* ------------------------------------------------------------ turn */
 
     const prevYaw = this.yaw;
-    if (wants) {
+    const aiming = this.faceYaw !== null;
+    if (aiming) {
+      // Snap round to the camera fast: any lag here is lag between where the
+      // crosshair is and where the character is pointed.
+      const delta = Math.atan2(
+        Math.sin((this.faceYaw as number) - this.yaw),
+        Math.cos((this.faceYaw as number) - this.yaw),
+      );
+      this.yaw += THREE.MathUtils.clamp(delta * 14 * dt, -Math.abs(delta), Math.abs(delta));
+    } else if (wants) {
       const target = Math.atan2(this.dir.x, this.dir.y);
       let delta = target - this.yaw;
       delta = Math.atan2(Math.sin(delta), Math.cos(delta));
@@ -139,14 +157,19 @@ export class Controller {
 
     /* --------------------------------------------------------- velocity */
 
-    // Bleed off speed while she is still swinging around toward the new heading.
     const facing = new THREE.Vector2(Math.sin(this.yaw), Math.cos(this.yaw));
-    const alignment = wants ? Math.max(0, facing.dot(this.dir)) : 0;
-    const targetSpeed = wants ? top * (0.35 + 0.65 * alignment) : 0;
+    // Aiming moves along the input direction rather than along the facing, so
+    // she can sidestep and back off while keeping the gun on target. Capped
+    // lower, because a full sprint sideways looks like a glitch.
+    const desired = aiming
+      ? this.dir.clone().multiplyScalar(wants ? Math.min(top, GAIT.walkSpeed * 1.05) : 0)
+      : facing
+          .clone()
+          // Bleed off speed while she is still swinging toward the new heading.
+          .multiplyScalar(wants ? top * (0.35 + 0.65 * Math.max(0, facing.dot(this.dir))) : 0);
 
     // Much less authority in the air — you commit to a jump's trajectory.
     const accel = (wants ? 14 : 18) * (this.grounded ? 1 : 0.22);
-    const desired = facing.clone().multiplyScalar(targetSpeed);
     if (this.grounded || wants) this.vel.lerp(desired, Math.min(1, accel * dt));
     if (this.vel.lengthSq() < 1e-5) this.vel.set(0, 0);
 
