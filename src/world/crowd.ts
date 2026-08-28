@@ -262,7 +262,13 @@ export function buildCrowd(colliders: Colliders, beach: BeachResult): Crowd {
     pose: Static | null = null,
     beach = false,
   ): Agent => {
-    const { rig } = buildMara(randomOptions(rng, beach));
+    // Live agents collapse to one SkinnedMesh — 40 draw calls down to about a
+    // dozen, and the same again saved in the shadow pass. The posed ones must
+    // keep their loose hierarchy: `poseSeated` and friends run *after* this
+    // call, and a skeleton captured at the rest pose would have to be rebound
+    // to pick the pose up. They never animate, so the bake below is a better
+    // answer for them anyway.
+    const { rig } = buildMara({ ...randomOptions(rng, beach), skinned: pose === null });
     const pos = new THREE.Vector3(x, groundHeight(x, z), z);
     rig.root.position.copy(pos);
     rig.root.rotation.y = yaw;

@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { loft, limb, Section } from '../util/loft';
 import * as T from '../render/textures';
 import { bakeStatic } from '../util/bake';
+import { skinRig } from './skin';
 
 /**
  * Mara, built as an articulated bone hierarchy of lofted body parts rather
@@ -303,6 +304,11 @@ function hand(mats: MaraMaterials, res: number): THREE.Group {
 function buildHead(mats: MaraMaterials, opts: Required<RigOptions>): THREE.Group {
   const g = new THREE.Group();
   const hero = opts.detail === 'hero';
+  // Same scaler as buildMara's. The hair and the jewellery below used to be
+  // authored at a fixed resolution, so `detail: 'crowd'` never reached them —
+  // the hair mass alone was 2154 of a pedestrian's triangles, more than her
+  // whole head, on a figure who is thirty metres away.
+  const R = (n: number) => (hero ? n : Math.max(6, Math.round(n * 0.55)));
 
   // Skull: chin at y = 0, crown near y = 0.235.
   const skull = loft(
@@ -364,7 +370,7 @@ function buildHead(mats: MaraMaterials, opts: Required<RigOptions>): THREE.Group
     g.add(ear);
 
     if (opts.earrings) {
-      const hoop = mesh(new THREE.TorusGeometry(0.026, 0.0032, 6, 20), mats.gold);
+      const hoop = mesh(new THREE.TorusGeometry(0.026, 0.0032, 6, R(20)), mats.gold);
       hoop.position.set(s * 0.079, 0.09, -0.006);
       hoop.rotation.y = Math.PI / 2;
       g.add(hoop);
@@ -395,7 +401,7 @@ function buildHead(mats: MaraMaterials, opts: Required<RigOptions>): THREE.Group
 
   // Slicked-back crown cap, then the back-and-sides mass.
   const cap = mesh(
-    new THREE.SphereGeometry(1, 26, 16, 0, Math.PI * 2, 0, 1.02),
+    new THREE.SphereGeometry(1, R(26), R(16), 0, Math.PI * 2, 0, 1.02),
     mats.hair,
   );
   cap.scale.set(0.087, 0.128, 0.098);
@@ -405,7 +411,7 @@ function buildHead(mats: MaraMaterials, opts: Required<RigOptions>): THREE.Group
   // Leave the face open: gap centred on +Z (phi = PI/2).
   const gap = 1.45;
   const back = mesh(
-    new THREE.SphereGeometry(1, 26, 20, Math.PI / 2 + gap / 2, Math.PI * 2 - gap, 0.98, 1.15),
+    new THREE.SphereGeometry(1, R(26), R(20), Math.PI / 2 + gap / 2, Math.PI * 2 - gap, 0.98, 1.15),
     mats.hair,
   );
   back.scale.set(0.087, 0.128, 0.098);
@@ -414,14 +420,14 @@ function buildHead(mats: MaraMaterials, opts: Required<RigOptions>): THREE.Group
 
   // Bun of gathered hair where the ponytail is tied off.
   if (opts.ponytail) {
-    const tie = mesh(new THREE.SphereGeometry(0.032, 14, 12), mats.hair);
+    const tie = mesh(new THREE.SphereGeometry(0.032, R(14), R(12)), mats.hair);
     tie.position.set(0, 0.196, -0.06);
     tie.scale.set(0.9, 0.8, 0.9);
     g.add(tie);
   } else {
     // Loose hair falling to the shoulders instead.
     const fall = mesh(
-      new THREE.SphereGeometry(1, 20, 16, Math.PI / 2 + 0.7, Math.PI * 2 - 1.4, 0.9, 1.5),
+      new THREE.SphereGeometry(1, R(20), R(16), Math.PI / 2 + 0.7, Math.PI * 2 - 1.4, 0.9, 1.5),
       mats.hair,
     );
     fall.scale.set(0.094, 0.24, 0.108);
@@ -445,7 +451,7 @@ function buildHead(mats: MaraMaterials, opts: Required<RigOptions>): THREE.Group
     bevelSize: 0.0018,
     bevelThickness: 0.0015,
     bevelSegments: 2,
-    curveSegments: 16,
+    curveSegments: hero ? 16 : 8,
   });
 
   for (const s of [-1, 1]) {
@@ -453,7 +459,7 @@ function buildHead(mats: MaraMaterials, opts: Required<RigOptions>): THREE.Group
     l.position.set(s * 0.032, 0, 0);
     shades.add(l);
 
-    const rim = mesh(new THREE.TorusGeometry(0.028, 0.0022, 6, 22), mats.gold);
+    const rim = mesh(new THREE.TorusGeometry(0.028, 0.0022, 6, R(22)), mats.gold);
     rim.position.set(s * 0.032, 0, 0.002);
     rim.scale.y = 0.82;
     shades.add(rim);
@@ -489,6 +495,16 @@ export interface RigOptions {
   scale?: number;
   /** Broader shoulders, narrower hips. */
   build?: 'fem' | 'masc';
+  /**
+   * Collapse the finished rig into one SkinnedMesh — see `player/skin.ts`.
+   *
+   * Costs nothing visually and turns ~40 draw calls into one per material, so
+   * every animated pedestrian wants it. The two exceptions are Mara herself,
+   * who is a single rig and is worth keeping inspectable, and the posed
+   * sunbathers and diners, who never move a joint and are cheaper still as
+   * static geometry merged by the bake.
+   */
+  skinned?: boolean;
 }
 
 const DEFAULTS: Required<RigOptions> = {
@@ -500,11 +516,14 @@ const DEFAULTS: Required<RigOptions> = {
   necklace: true,
   scale: 1,
   build: 'fem',
+  skinned: false,
 };
 
 export function buildMara(options: RigOptions = {}): {
   rig: MaraRig;
   mats: MaraMaterials;
+  /** The collapsed body, when `skinned` was asked for. */
+  skin: THREE.SkinnedMesh | null;
 } {
   const opts: Required<RigOptions> = { ...DEFAULTS, ...options };
   const mats = materials(opts.look);
@@ -608,7 +627,7 @@ export function buildMara(options: RigOptions = {}): {
   hips.add(gusset);
 
   if (opts.necklace) {
-    const chain = mesh(new THREE.TorusGeometry(0.048, 0.0022, 6, 26), mats.gold);
+    const chain = mesh(new THREE.TorusGeometry(0.048, 0.0022, 6, R(26)), mats.gold);
     chain.position.set(0, 0.276, 0.012);
     chain.rotation.x = Math.PI / 2 - 0.24;
     chain.scale.set(1, 0.86, 1);
@@ -794,8 +813,27 @@ export function buildMara(options: RigOptions = {}): {
     }
   });
 
-  return {
-    rig: { root, hips, spine, chest, neck, head, legL, legR, armL, armR, ponytail },
-    mats,
-  };
+  const rig: MaraRig = { root, hips, spine, chest, neck, head, legL, legR, armL, armR, ponytail };
+
+  // Every joint the animator writes to, and nothing else: the eye sockets, the
+  // hand and the sunglasses are groups too, but they are rigid inside the joint
+  // that carries them, so their contents bind to that joint instead of costing
+  // a bone. The rig is still at its rest pose here, which is what the skeleton
+  // captures its inverse bind matrices from.
+  const skin = opts.skinned
+    ? skinRig(root, [
+        hips,
+        spine,
+        chest,
+        neck,
+        head,
+        ...ponytail,
+        legL.hip, legL.knee, legL.ankle,
+        legR.hip, legR.knee, legR.ankle,
+        armL.shoulder, armL.elbow, armL.wrist,
+        armR.shoulder, armR.elbow, armR.wrist,
+      ])
+    : null;
+
+  return { rig, mats, skin };
 }
