@@ -475,6 +475,78 @@ project. `player/animator.ts` evaluates every joint angle per frame from a gait
 phase that advances with **distance actually travelled**, which is why the feet
 never skate.
 
+### Collision, and who is in the collider set
+
+`Colliders` holds **axis-aligned boxes**, and `addRotatedBox` takes *world-axis*
+extents: at yaw 0 its `sx` is the X extent. A heading of 0 in this project means
+facing **+Z**, so anything with a heading has its length along Z and its width
+along X — and passing `(length, width)` therefore lays the footprint across the
+road instead of along it. Every kerbside car did exactly that: the box stuck
+2.4 m out into the lane and stopped 1 m short of the doors, so you could walk
+through a parked car sideways and not drive past one. **Use `addHeadingBox` (or
+`addSwitchableBox`, which matches it) for anything with a heading**; they take
+length-along-heading and width-across and do the swap themselves.
+
+Two things are deliberately *not* in the collider set:
+
+- **Pedestrians.** They used to get a circle each at build time. That is wrong
+  twice over: it is a permanent obstacle at a position they abandon the moment
+  a panic sends them running, and it is a *wall to a car* — driving into a
+  crowd stopped the car dead instead of scattering it. Contact is handled where
+  it belongs: walkers sidestep the player themselves, and cars run people over
+  through `world.runOverPerson`.
+- **Moving traffic.** 616 boxes would be rewritten and walked on every
+  `resolve` *and* on every 25 cm step of the camera arm's `raycastXZ`, which is
+  O(colliders). Traffic is exposed as `VehicleBody` — an oriented rectangle read
+  directly by whatever needs it — and only the cars the player actually parks
+  ever get a real collider, created lazily on first use.
+
+`insideBody` in `world/traffic.ts` is the shared point-in-oriented-rectangle
+test: run-overs by traffic, run-overs by the player, and car-to-car contact all
+go through it.
+
+### Driving
+
+An arcade model, not a simulation, but it has one property a bicycle model does
+not: **the car has momentum that the tyres have to fight**. The old version set
+the heading straight from the steering angle, so the car pointed wherever the
+wheels did and pivoted on the spot at 100 km/h.
+
+Three pieces make it work, and none of them can be dropped:
+
+- **The yaw rate is limited by front grip.** Cornering demands lateral
+  acceleration; asking for more than `FRONT_GRIP` understeers. This is what
+  makes speed feel like weight.
+- **Momentum is rotated into the car's frame.** When the heading changes by
+  `dYaw`, the body-frame velocity is rotated by `-dYaw`, which converts
+  longitudinal speed into lateral. This is the whole reason a flick left then
+  right builds a slide: each reversal pours more speed into `lateral` than the
+  rear can take back out.
+- **`FRONT_GRIP` and `REAR_GRIP` must differ.** The rear absorbs lateral at a
+  fixed *rate*, not a fixed fraction — a proportional decay can always keep up
+  and so can never slide at all. The first attempt clamped the yaw rate and
+  absorbed the slide with the *same* number, which meant the car cornered
+  exactly at the limit forever and could not be made to drift by any input,
+  handbrake included.
+
+Measured at 100 km/h: full lock builds to a held 22–28° slip angle without
+spinning; a hard left then hard right reverses the heading through zero and
+settles into a 25° drift; the handbrake goes straight to a slide.
+
+Two traps around it:
+
+- **`kph` is the whole velocity, not `speed`.** `speed` is the longitudinal
+  component only, so a car travelling sideways in a drift has almost none of it
+  — the speedo read near zero mid-slide until this was fixed.
+- The handbrake brakes with `HANDBRAKE_BRAKE`, far weaker than the pedal. At
+  full brake force a handbrake turn stopped the car dead in about a second,
+  which is a spin rather than a slide; carrying momentum through the corner is
+  the point.
+
+Being hit by a car takes control away for `KNOCK_TIME` — `Controller.knock`.
+The animator owns the joints and `main.ts` owns the root pitch, the same split
+the crowd's collapse uses, because only the caller knows where the ground is.
+
 ### Panic
 
 `world/panic.ts` is the street's reaction to a drawn weapon. Aiming calls

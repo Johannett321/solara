@@ -783,7 +783,7 @@ export function buildCars(colliders: Colliders): CarsResult {
     staticGroup.add(build.group);
 
     const s = SPECS[kind];
-    colliders.addRotatedBox(x, z, s.length, s.width, yaw, s.roofY);
+    colliders.addHeadingBox(x, z, s.length, s.width, yaw, s.roofY);
   };
 
   /**

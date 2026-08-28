@@ -3,6 +3,7 @@ import { Input } from '../core/input';
 import { Colliders } from '../world/collision';
 import { Drivable } from '../world/cars';
 import { groundHeight } from '../world/layout';
+import { insideBody, VehicleBody } from '../world/traffic';
 
 /**
  * Arcade car handling — a kinematic bicycle model with a grip/slip split.
@@ -21,11 +22,42 @@ const TOP_SPEED = 34;
 const REVERSE_TOP = 9;
 /** Engine braking / rolling resistance when off the throttle. */
 const COAST = 4.2;
+/** The handbrake locks the rear only — nothing like the brake pedal. */
+const HANDBRAKE_BRAKE = 4.5;
 const MAX_STEER = THREE.MathUtils.degToRad(34);
 /** Steering authority falls off with speed, or it's undriveable at 100 km/h. */
-const STEER_FALLOFF = 0.028;
-const GRIP = 9.0;
-const SLIP_GRIP = 1.6;
+const STEER_FALLOFF = 0.045;
+
+/**
+ * Front and rear grip budgets, in m/s². **These must differ.**
+ *
+ * The front number limits how hard the steering can drag the car into a turn —
+ * ask for more and it understeers, which is what stops the car pivoting on the
+ * spot at 100 km/h the way it used to.
+ *
+ * The rear number is how much sideways velocity the back tyres can kill per
+ * second. If it is *lower* than the front, hard cornering generates lateral
+ * faster than the rear can absorb, the tail comes out, and the oversteer term
+ * below turns that into a held drift. Setting both to the same value — which is
+ * what the first attempt did — makes the car corner exactly at the limit
+ * forever and it can never slide at all, handbrake included.
+ */
+const FRONT_GRIP = 13.5;
+const REAR_GRIP = 9.5;
+/** With the handbrake in, the rear has almost nothing. */
+const HANDBRAKE_REAR = 3.1;
+/**
+ * How much a slide steers the car on its own.
+ *
+ * The rear stepping out rotates the nose further into the corner, which is what
+ * makes a drift hold itself rather than washing out the moment you stop
+ * steering. Too high and the car spins on any provocation.
+ */
+const OVERSTEER = 0.42;
+/** Sliding sideways scrubs speed. Enough to cost you, not enough to stop you. */
+const SCRUB = 0.34;
+/** Past this much lateral velocity the car counts as drifting, for the HUD. */
+const DRIFT_AT = 3.2;
 
 export class VehicleController {
   readonly position = new THREE.Vector3();
@@ -47,7 +79,32 @@ export class VehicleController {
     return Math.min(1, Math.abs(this.lateral) / 6);
   }
 
+  /** True once the slide is wide enough to read as a drift. */
+  get drifting(): boolean {
+    return Math.abs(this.lateral) > DRIFT_AT;
+  }
+
+  /** Bleed speed on a soft impact — a body, not a wall. */
+  scrubOnImpact(keep: number): void {
+    this.speed *= keep;
+    this.lateral *= keep;
+  }
+
+  /** Angle between where the car points and where it is going, in radians. */
+  get slipAngle(): number {
+    return Math.atan2(this.lateral, Math.max(0.5, Math.abs(this.speed)));
+  }
+
   car: Drivable | null = null;
+
+  /**
+   * Moving traffic, for car-to-car contact.
+   *
+   * Parked cars are handled by `Colliders` — they are static, so a box in the
+   * shared set is the right answer. Traffic is not: it moves, and 616 boxes
+   * being rewritten and walked every frame is not. Set once by `main.ts`.
+   */
+  traffic: VehicleBody[] = [];
 
   private forward = new THREE.Vector3();
   private prev = new THREE.Vector3();
@@ -57,9 +114,16 @@ export class VehicleController {
     private colliders: Colliders,
   ) {}
 
-  /** km/h, for the HUD. */
+  /**
+   * km/h, for the HUD.
+   *
+   * The *whole* velocity, not just the component along the nose. `speed` is
+   * longitudinal only, so a car travelling sideways in a drift has almost none
+   * of it — the speedo used to fall to nothing mid-slide while the car was
+   * still doing 70.
+   */
   get kph(): number {
-    return Math.abs(this.speed) * 3.6;
+    return Math.hypot(this.speed, this.lateral) * 3.6;
   }
 
   enter(car: Drivable): void {
@@ -133,7 +197,11 @@ export class VehicleController {
     }
 
     if (this.handbrake) {
-      const drop = BRAKE * 0.8 * dt;
+      // Rear wheels only, so far weaker than the brake pedal. At `BRAKE * 0.8`
+      // a handbrake turn stopped the car dead in about a second and a half,
+      // which is a spin rather than a slide — the momentum through the corner
+      // is the whole point.
+      const drop = HANDBRAKE_BRAKE * dt;
       this.speed = Math.abs(this.speed) <= drop ? 0 : this.speed - Math.sign(this.speed) * drop;
     }
 
@@ -146,16 +214,54 @@ export class VehicleController {
     this.steer += (steerTarget - this.steer) * Math.min(1, dt * 9);
 
     const wheelbase = car.build.spec.axle[1] - car.build.spec.axle[0];
-    // Bicycle model: yaw rate follows from speed, wheelbase and steer angle.
-    const yawRate = (this.speed / Math.max(0.1, Math.abs(wheelbase))) * Math.tan(this.steer);
-    this.yaw += yawRate * dt;
+    // What the front wheels are asking for.
+    let yawRate = (this.speed / Math.max(0.1, Math.abs(wheelbase))) * Math.tan(this.steer);
 
-    /* ------------------------------------------------------------- slide */
+    /* -------------------------------------------------- grip and slide */
 
-    // Cornering throws lateral velocity that grip has to eat back up.
-    this.lateral += yawRate * this.speed * dt * 0.55;
-    const grip = this.handbrake ? SLIP_GRIP : GRIP;
-    this.lateral -= this.lateral * Math.min(1, grip * dt);
+    const rearGrip = this.handbrake ? HANDBRAKE_REAR : REAR_GRIP;
+
+    // Turning at speed needs lateral acceleration, and the front tyres only
+    // have so much. Asking for more understeers: the car turns less than the
+    // wheels say, which is the whole reason it no longer pivots on the spot at
+    // 100 km/h.
+    const demand = Math.abs(yawRate * this.speed);
+    if (demand > FRONT_GRIP) yawRate *= FRONT_GRIP / demand;
+
+    // The slide steers the car. A rear that has stepped out to the right
+    // rotates the nose to the left, and this term is what makes a drift hold
+    // itself instead of snapping straight the moment the steering is centred.
+    yawRate -= (this.lateral * OVERSTEER) / Math.max(3, Math.abs(this.speed));
+
+    const dYaw = yawRate * dt;
+    this.yaw += dYaw;
+
+    // Momentum does not turn with the car. Rotating the body-frame velocity by
+    // -dYaw is what converts a change of heading into sideways motion, and it
+    // is the entire reason a flick left then right builds a slide: each
+    // reversal pours more of the car's speed into `lateral` than the tyres can
+    // take back out.
+    const c = Math.cos(dYaw);
+    const sn = Math.sin(dYaw);
+    const long = this.speed * c + this.lateral * sn;
+    const lat = -this.speed * sn + this.lateral * c;
+    this.speed = long;
+    this.lateral = lat;
+
+    // The rear pulls the slide back in at a fixed *rate*, not a fixed fraction.
+    // A proportional decay can always keep up and so can never actually slide;
+    // a budget is what lets a big enough provocation exceed it.
+    const bite = rearGrip * dt;
+    this.lateral -= THREE.MathUtils.clamp(this.lateral, -bite, bite);
+    // Nothing survives a spin: cap the slide so a long drift settles into a
+    // shape the player can hold rather than winding up forever.
+    this.lateral = THREE.MathUtils.clamp(this.lateral, -13, 13);
+
+    // Scrubbing sideways costs speed, which is what stops a drift being free.
+    this.speed -= Math.sign(this.speed) * Math.min(
+      Math.abs(this.speed),
+      Math.abs(this.lateral) * SCRUB * dt,
+    );
 
     /* --------------------------------------------------------- integrate */
 
@@ -178,6 +284,40 @@ export class VehicleController {
       this.impact = Math.min(1, Math.abs(this.speed) / 18);
       this.speed *= 0.35;
       this.lateral = 0;
+    }
+
+    /* ---------------------------------------------------- car to car */
+
+    // Traffic, tested as oriented rectangles. Approximating the player's car
+    // by three points down its centre line rather than one is what stops it
+    // driving nose-first through a car it is clearly touching.
+    const half = car.build.spec.length * 0.5;
+    for (const b of this.traffic) {
+      if (b.taken) continue;
+      const dx = b.position.x - this.position.x;
+      const dz = b.position.z - this.position.z;
+      if (dx * dx + dz * dz > 64) continue;
+      for (const t of [-half * 0.75, 0, half * 0.75]) {
+        const px = this.position.x + this.forward.x * t;
+        const pz = this.position.z + this.forward.z * t;
+        if (!insideBody(b, px, pz, radius)) continue;
+        // Push straight apart along the line of centres. Both cars are the
+        // same mass here; the AI one is not simulated, so the player takes all
+        // of the separation and all of the speed loss.
+        const d = Math.max(0.001, Math.hypot(dx, dz));
+        const overlap = b.halfLength + radius - d;
+        if (overlap > 0) {
+          this.position.x -= (dx / d) * overlap;
+          this.position.z -= (dz / d) * overlap;
+        }
+        // Closing speed, not absolute speed: rear-ending someone doing your
+        // own speed should barely register.
+        const closing = Math.abs(this.speed - b.speed * Math.sign(this.forward.z * Math.cos(b.yaw) + this.forward.x * Math.sin(b.yaw) || 1));
+        this.impact = Math.max(this.impact, Math.min(1, closing / 18));
+        this.speed *= 0.45;
+        this.lateral *= 0.4;
+        break;
+      }
     }
 
     // Ride the surface rather than the road plane, so mounting the kerb lifts

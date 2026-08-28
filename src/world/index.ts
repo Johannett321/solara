@@ -5,7 +5,7 @@ import { buildBuildings, BuildingsResult, Footprint, setStripNight } from './bui
 import { buildProps, PropsResult } from './props';
 import { buildCars, CarsResult, Drivable, setCarNight } from './cars';
 import { buildCrowd, Crowd } from './crowd';
-import { buildTraffic, Traffic } from './traffic';
+import { buildTraffic, Traffic, VehicleBody } from './traffic';
 import { buildTerrain } from './terrain';
 import { buildBeach, BeachResult } from './beach';
 import { buildBoats, BoatsResult, Boat } from './boats';
@@ -34,12 +34,20 @@ export interface World {
   crowdPositions(): THREE.Vector3[];
   /** Shootable pedestrians — see `weapons/ballistics.ts`. Held by reference. */
   people: PersonTarget[];
+  /**
+   * Moving traffic as oriented rectangles, for anything that has to collide
+   * with a car rather than merely notice one. Held by reference and rewritten
+   * in place each frame.
+   */
+  trafficBodies: VehicleBody[];
   /** Put a round into person `index`, from a shot travelling `dirX,dirZ`. */
   shootPerson(index: number, zone: HitZone, dirX: number, dirZ: number, hitY: number): void;
   /** Agent state for `window.SOLARA` — see `Crowd.debug`. */
   personDebug(index: number): Record<string, unknown> | null;
   /** Drop a fleeing pedestrian on the street — the driver of a stolen car. */
   ejectDriver(x: number, z: number, yaw: number): void;
+  /** Run person `index` down. True if this was the blow that landed. */
+  runOverPerson(index: number, speed: number, dirX: number, dirZ: number): boolean;
   /**
    * The street's reaction to a drawn weapon. Call `alarm` every frame the
    * player is aiming; everything else reads it.
@@ -176,7 +184,7 @@ export function buildWorld(): World {
 
   // Runtime-spawned pedestrians — the driver hauled out of a car — have to be
   // handed to the culler, which is built below them.
-  const crowd: Crowd = buildCrowd(colliders, beach, (c) => culler.track(c));
+  const crowd: Crowd = buildCrowd(beach, (c) => culler.track(c));
   group.add(crowd.group);
   chunks(crowd.posed, RANGE.posedCrowd);
 
@@ -226,10 +234,12 @@ export function buildWorld(): World {
     footprints: [...buildings.footprints, ...city.footprints],
     crowdPositions: () => crowd.positions(),
     people: crowd.people,
+    trafficBodies: traffic.bodies,
     panic,
     shootPerson: (i, zone, dirX, dirZ, hitY) => crowd.shoot(i, zone, dirX, dirZ, hitY),
     personDebug: (i) => crowd.debug(i),
     ejectDriver: (x, z, yaw) => crowd.eject(x, z, yaw),
+    runOverPerson: (i, speed, dirX, dirZ) => crowd.runOver(i, speed, dirX, dirZ),
     waterHeight: (x, z) => ocean.heightAt(x, z),
     setNight(f) {
       setFacadeNight(f);
@@ -250,7 +260,7 @@ export function buildWorld(): World {
       ocean.update(t);
       harbour.water.update(t);
       panic.update(dt);
-      crowd.update(dt, playerPos, panic);
+      crowd.update(dt, playerPos, panic, traffic.bodies);
       traffic.update(dt, playerPos, panic);
 
       // Moored boats ride the same waves the player's boat does.

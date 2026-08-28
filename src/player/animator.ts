@@ -147,6 +147,8 @@ export interface LocomotionState {
   injurySide?: number;
   /** 0 calm, 1 running from a drawn gun. */
   panic?: number;
+  /** 0..1 through a knockdown: hit by a car, on the ground, getting up. */
+  knocked?: number;
 }
 
 interface Link {
@@ -362,6 +364,13 @@ export class MaraAnimator {
     if (this.land > 0.001) this.poseLanding(this.land);
     if (this.swim > 0.001) this.poseSwim(this.swim, speed);
 
+    // A knockdown owns the whole body and nothing layers on top of it — she is
+    // not walking, aiming or flinching while she is on the pavement.
+    if (st.knocked !== undefined && st.knocked > 0 && st.knocked < 1) {
+      this.poseKnocked(st.knocked);
+      return;
+    }
+
     // Running scared goes on before the wound, so a limping runner still limps.
     if (st.panic && st.panic > 0.02) this.posePanic(st.panic, ph, g);
 
@@ -544,6 +553,50 @@ export class MaraAnimator {
       arm.shoulder.rotation.z = L(arm.shoulder.rotation.z, sgn * 0.26, k);
       arm.shoulder.rotation.y = L(arm.shoulder.rotation.y, sgn * -0.3, k);
       arm.elbow.rotation.x = L(arm.elbow.rotation.x, -1.5, k);
+    }
+  }
+
+  /**
+   * Hit by a car: down, and back up.
+   *
+   * Three phases over `t` in 0..1 — thrown, lying still, then rising. The
+   * *root* pitch is applied by `main.ts`, the same split the crowd's collapse
+   * uses: the animator owns the joints and the caller owns which way up the
+   * body is, because only the caller knows where the ground is.
+   */
+  private poseKnocked(t: number): void {
+    const r = this.rig;
+    // 0..1 tumbling, 1 flat, then unwinding as she gets up.
+    const down = t < 0.18 ? t / 0.18 : t > 0.72 ? Math.max(0, 1 - (t - 0.72) / 0.28) : 1;
+    const rise = t > 0.72 ? (t - 0.72) / 0.28 : 0;
+
+    r.hips.position.y = P.hipY - 0.02 * down;
+    r.hips.rotation.set(0, 0, 0.18 * down);
+    r.spine.rotation.set(0.22 * down - 0.5 * rise, 0.1 * down, 0.1 * down);
+    r.chest.rotation.set(0.12 * down, 0.08 * down, 0);
+    r.head.rotation.set(-0.3 * down + 0.5 * rise, 0.15 * down, 0);
+
+    // Legs fold up on impact and push under her to stand.
+    for (const [leg, side] of [
+      [r.legL, 1],
+      [r.legR, -1],
+    ] as const) {
+      leg.hip.rotation.x = -0.75 * down - 0.6 * rise;
+      leg.hip.rotation.z = side * 0.2 * down;
+      leg.knee.rotation.x = 1.1 * down + 1.0 * rise;
+      leg.ankle.rotation.x = 0.25 * down;
+    }
+
+    // Arms out on the way down, then under her to push up.
+    for (const [arm, side] of [
+      [r.armL, 1],
+      [r.armR, -1],
+    ] as const) {
+      arm.shoulder.rotation.x = 0.15 * down - 0.9 * rise;
+      arm.shoulder.rotation.z = side * (0.5 * down + 0.2 * rise);
+      arm.shoulder.rotation.y = 0;
+      arm.elbow.rotation.x = -0.35 * down - 0.8 * rise;
+      arm.wrist.rotation.set(0, 0, 0);
     }
   }
 

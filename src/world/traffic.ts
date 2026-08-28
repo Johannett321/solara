@@ -51,6 +51,40 @@ interface Vehicle {
   taken: boolean;
   /** Still carrying its AI driver, who gets hauled out on the first carjack. */
   hasDriver: boolean;
+  /** Body, for run-overs and car-to-car contact. */
+  body: VehicleBody;
+}
+
+/**
+ * A moving car, as an oriented rectangle.
+ *
+ * Traffic cannot use `Colliders`: those are axis-aligned boxes rebuilt on
+ * `move`, and 616 of them would be walked by every `resolve` and every 25 cm
+ * step of the camera arm. These are read directly by whatever needs them — the
+ * crowd for run-overs, `player/driving.ts` for car-to-car contact — and every
+ * field is written in place each frame, so the array never reallocates.
+ */
+export interface VehicleBody {
+  position: THREE.Vector3;
+  yaw: number;
+  halfLength: number;
+  halfWidth: number;
+  /** Ground speed, m/s. Impact severity comes from this. */
+  speed: number;
+  /** The player is driving it; nothing should collide it with itself. */
+  taken: boolean;
+}
+
+/** Is `px,pz` inside the body's footprint, grown by `pad`? */
+export function insideBody(b: VehicleBody, px: number, pz: number, pad = 0): boolean {
+  const dx = px - b.position.x;
+  const dz = pz - b.position.z;
+  const f = Math.sin(b.yaw);
+  const c = Math.cos(b.yaw);
+  // Heading is (sin, cos); its right is (cos, -sin).
+  const along = dx * f + dz * c;
+  const across = dx * c - dz * f;
+  return Math.abs(along) < b.halfLength + pad && Math.abs(across) < b.halfWidth + pad;
 }
 
 export interface Traffic {
@@ -63,6 +97,8 @@ export interface Traffic {
    * know the difference — the only thing that marks them out is `hasDriver`.
    */
   drivables: Drivable[];
+  /** One per car, updated in place — see `VehicleBody`. */
+  bodies: VehicleBody[];
   update(dt: number, playerPos: THREE.Vector3, panic: Panic): void;
 }
 
@@ -131,6 +167,7 @@ export function buildTraffic(colliders: Colliders): Traffic {
   const vehicles: Vehicle[] = [];
   const cullable: Cullable[] = [];
   const drivables: Drivable[] = [];
+  const bodies: VehicleBody[] = [];
 
   /**
    * A collider that does not exist until the car is abandoned.
@@ -186,11 +223,22 @@ export function buildTraffic(colliders: Colliders): Traffic {
       };
       cullable.push(cull);
 
+      const body: VehicleBody = {
+        position: build.group.position,
+        yaw: heading,
+        halfLength: carSpec(kind).length * 0.5,
+        halfWidth: carSpec(kind).width * 0.5,
+        speed: 0,
+        taken: false,
+      };
+      bodies.push(body);
+
       const v: Vehicle = {
         group: build.group,
         cull,
         taken: false,
         hasDriver: true,
+        body,
         lane: laneX,
         deckY: lane.y,
         dir,
@@ -219,6 +267,8 @@ export function buildTraffic(colliders: Colliders): Traffic {
           v.taken = true;
           v.speed = 0;
           v.cull.near = true;
+          body.taken = true;
+          body.speed = 0;
         },
       });
     }
@@ -230,6 +280,7 @@ export function buildTraffic(colliders: Colliders): Traffic {
     group,
     cullable,
     drivables,
+    bodies,
     update(dt, playerPos, panic) {
       for (const v of vehicles) {
         // Taken cars belong to the player now; the driving model owns their
@@ -287,6 +338,10 @@ export function buildTraffic(colliders: Colliders): Traffic {
         // Point where it is actually going, so a swerving car leans into it.
         const drift = v.panic * Math.cos(v.z * 0.22 + v.wobble) * 0.3;
         v.group.rotation.y = (v.dir > 0 ? 0 : Math.PI) + Math.PI / 2 - drift * v.dir;
+
+        // Keep the body in step with what was just drawn.
+        v.body.yaw = v.dir > 0 ? 0 : Math.PI;
+        v.body.speed = v.speed;
 
         // Roll the wheels to match ground speed.
         const spin = (v.speed / v.wheelR) * dt * v.dir;

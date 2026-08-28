@@ -53,6 +53,28 @@ export class Colliders {
     return this;
   }
 
+  /**
+   * Footprint of something facing `yaw`, given its own length and width.
+   *
+   * **Use this for anything with a heading.** `addRotatedBox` below takes
+   * *world-axis* extents — at yaw 0 its `sx` is the X extent — while a heading
+   * of 0 in this project means facing **+Z**, so a car's length runs along Z
+   * and its width along X. Passing `(length, width)` to `addRotatedBox`
+   * therefore lays the footprint across the road instead of along it, which is
+   * exactly the bug that had parked cars blocking a lane of Ocean Drive while
+   * you could walk through their doors.
+   */
+  addHeadingBox(
+    cx: number,
+    cz: number,
+    length: number,
+    width: number,
+    yaw: number,
+    top = 50,
+  ): this {
+    return this.addRotatedBox(cx, cz, width, length, yaw, top);
+  }
+
   /** Footprint of an arbitrarily rotated box, approximated by its AABB. */
   addRotatedBox(
     cx: number,
@@ -68,17 +90,20 @@ export class Colliders {
   }
 
   /**
-   * Same as `addRotatedBox`, but hands back a handle that can switch the
-   * obstacle off or re-place it as the object it represents moves.
+   * Same as `addHeadingBox`, but hands back a handle that can switch the
+   * obstacle off or re-place it as the object it represents moves. Takes
+   * `length` along the heading and `width` across it.
    */
   addSwitchableBox(
     cx: number,
     cz: number,
-    sx: number,
-    sz: number,
+    length: number,
+    width: number,
     yaw: number,
     top = 50,
   ): ColliderHandle {
+    const sx = width;
+    const sz = length;
     this.addRotatedBox(cx, cz, sx, sz, yaw, top);
     const box = this.boxes[this.boxes.length - 1];
     return {

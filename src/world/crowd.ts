@@ -2,7 +2,6 @@ import * as THREE from 'three';
 import { Rng } from '../core/rng';
 import { buildMara, Look, RigOptions, MaraRig, P } from '../player/rig';
 import { MaraAnimator, LocomotionState } from '../player/animator';
-import { Colliders } from './collision';
 import { bakeChunked } from '../util/bake';
 import type { Cullable } from './culling';
 import {
@@ -21,6 +20,7 @@ import {
 import type { BeachResult } from './beach';
 import type { HitZone, PersonTarget } from '../weapons/ballistics';
 import type { Panic } from './panic';
+import { insideBody, VehicleBody } from './traffic';
 
 /* ------------------------------------------------------------------ looks */
 
@@ -267,6 +267,16 @@ export type Injury = 'none' | 'leg' | 'arm' | 'gut';
 
 /** Body shots a pedestrian survives. A head shot is always fatal. */
 const BODY_HITS_TO_KILL = 3;
+/**
+ * Being hit this fast is fatal, in m/s.
+ *
+ * About 22 km/h. Below it they are knocked down and get up hurt; above it they
+ * do not get up. Traffic cruises at 7.5–12.5, so an ordinary car on an ordinary
+ * street kills — which is the point of stepping into the road.
+ */
+const RUN_OVER_LETHAL = 6.2;
+/** Below this a car is just nudging past and nobody reacts. */
+const RUN_OVER_MIN = 2.2;
 /** Seconds the flinch takes to play out. */
 const FLINCH_TIME = 0.42;
 /** Seconds the collapse takes. */
@@ -361,11 +371,16 @@ export interface Crowd {
    * as a spawner — this is not a general population system.
    */
   eject(x: number, z: number, yaw: number): void;
+  /**
+   * Hit by the player's car. Returns true if this was the blow that landed —
+   * false for someone already down, so the caller does not re-charge for it.
+   */
+  runOver(index: number, speed: number, dirX: number, dirZ: number): boolean;
   /** The posed sunbathers and diners, baked. Chunked, so it culls per chunk. */
   posed: THREE.Group;
   /** Live pedestrian positions, for the map overlay. */
   positions(): THREE.Vector3[];
-  update(dt: number, playerPos: THREE.Vector3, panic: Panic): void;
+  update(dt: number, playerPos: THREE.Vector3, panic: Panic, traffic: VehicleBody[]): void;
 }
 
 /** Pedestrians past this range are hidden and stop animating. */
@@ -375,7 +390,6 @@ const LANES_EAST = [8.6, 9.8, 11.2, 13.4, 14.6];
 const LANES_WEST = [-8.6, -9.9, -11.4, -12.6];
 
 export function buildCrowd(
-  colliders: Colliders,
   beach: BeachResult,
   /** Hands a runtime-spawned agent to the culler, which is built later. */
   onSpawn?: (c: Cullable) => void,
@@ -643,10 +657,14 @@ export function buildCrowd(
     }
   }
 
-  // Standing figures are permanent obstacles; walkers are not.
-  for (const a of agents) {
-    if (a.idle) colliders.addCircle(a.pos.x, a.pos.z, 0.3, 1.6);
-  }
+  // Pedestrians deliberately have **no** entry in `Colliders`.
+  //
+  // Standing agents used to get a circle each, which was wrong twice over: it
+  // is a permanent obstacle at a position they no longer hold the moment a
+  // panic sends them running, and it is a wall to a car — driving into a crowd
+  // stopped the car dead instead of scattering it. Contact with people is
+  // handled where it belongs: walkers already sidestep the player, and cars run
+  // them over (`world.runOverPerson`).
 
   const posed = bakeChunked(statics, (o) => Math.floor(o.position.z / 40));
   group.add(posed);
@@ -671,6 +689,65 @@ export function buildCrowd(
     return { back: dirX * fx + dirZ * fz, side: dirX * fz - dirZ * fx };
   };
 
+  /**
+   * Everything that happens to a pedestrian who has just been hurt.
+   *
+   * Shared by rounds and by cars, because the outcomes are the same three:
+   * flinch, keep a wound and walk badly, or go down. `kind` decides whether
+   * this one is survivable — a head shot and a car at speed both skip straight
+   * to the collapse.
+   */
+  const hit = (
+    a: Agent,
+    kind: 'head' | 'body' | 'kill' | 'hurt',
+    dirX: number,
+    dirZ: number,
+    hitY: number,
+  ): void => {
+    if (a.dead) return;
+
+    const { back, side } = shotSide(a, dirX, dirZ);
+    a.flinch = 1;
+    a.flinchSide = THREE.MathUtils.clamp(side, -1, 1);
+    a.flinchHead = kind === 'head';
+
+    if (kind === 'head' || kind === 'kill') {
+      // Always fatal, whatever they have absorbed so far.
+      a.wounds = BODY_HITS_TO_KILL;
+    } else {
+      // A car that does not kill still costs more than a bullet.
+      a.wounds += kind === 'hurt' ? 2 : 1;
+      if (a.wounds < BODY_HITS_TO_KILL) {
+        // Survivors keep the wound, chosen from **where the blow actually
+        // landed** rather than from which way it was travelling: the player
+        // watched it hit, and a low shot that produces a clutched shoulder
+        // reads as a bug. The body sphere spans roughly hip to collarbone, so
+        // the height within it maps straight onto hip, gut and shoulder.
+        if (a.injury === 'none') {
+          const local = hitY - a.pos.y;
+          const t = (local - a.target.bodyY) / a.target.bodyR;
+          a.injury = t < -0.35 ? 'leg' : t > 0.35 ? 'arm' : 'gut';
+          // Side comes from the blow: which hip or shoulder took it.
+          a.injurySide = side >= 0 ? 1 : -1;
+        }
+        // Wounded people do not stroll.
+        a.speed *= a.injury === 'leg' ? 0.55 : 0.75;
+        a.calmSpeed = 0;
+        return;
+      }
+    }
+
+    a.dead = true;
+    a.target.dead = true;
+    a.dying = 0;
+    // Away from whatever hit them, so a round in the back drops them on their
+    // face and a car throws them the way it was going.
+    a.deathBack = back >= 0 ? -1 : 1;
+    a.deathSide = side >= 0 ? 1 : -1;
+    a.speed = 0;
+    a.idle = true;
+  };
+
   return {
     group,
     cullable,
@@ -678,45 +755,14 @@ export function buildCrowd(
     people,
     shoot(index, zone, dirX, dirZ, hitY) {
       const a = agents[index];
-      if (!a || a.dead) return;
-
-      const { back, side } = shotSide(a, dirX, dirZ);
-      a.flinch = 1;
-      a.flinchSide = THREE.MathUtils.clamp(side, -1, 1);
-      a.flinchHead = zone === 'head';
-
-      // A head shot is always fatal, whatever they have absorbed so far.
-      if (zone === 'head') {
-        a.wounds = BODY_HITS_TO_KILL;
-      } else {
-        a.wounds++;
-        if (a.wounds < BODY_HITS_TO_KILL) {
-          // Survivors keep the wound, chosen from **where the round actually
-          // landed** rather than from which way it was travelling: the player
-          // watched it hit, and a low shot that produces a clutched shoulder
-          // reads as a bug. The body sphere spans roughly hip to collarbone, so
-          // the height within it maps straight onto hip, gut and shoulder.
-          if (a.injury === 'none') {
-            const local = hitY - a.pos.y;
-            const t = (local - a.target.bodyY) / a.target.bodyR;
-            a.injury = t < -0.35 ? 'leg' : t > 0.35 ? 'arm' : 'gut';
-            // Side comes from the shot: which hip or shoulder took it.
-            a.injurySide = side >= 0 ? 1 : -1;
-          }
-          // Wounded people do not stroll.
-          a.speed *= a.injury === 'leg' ? 0.55 : 0.75;
-          return;
-        }
-      }
-
-      a.dead = true;
-      a.target.dead = true;
-      a.dying = 0;
-      // Away from the shooter, so a round in the back drops them on their face.
-      a.deathBack = back >= 0 ? -1 : 1;
-      a.deathSide = side >= 0 ? 1 : -1;
-      a.speed = 0;
-      a.idle = true;
+      if (a) hit(a, zone, dirX, dirZ, hitY);
+    },
+    runOver(index, speed, dirX, dirZ) {
+      const a = agents[index];
+      if (!a) return false;
+      const was = a.dead;
+      hit(a, speed >= RUN_OVER_LETHAL ? 'kill' : 'hurt', dirX, dirZ, a.pos.y + 0.8);
+      return !was;
     },
     eject(x, z, yaw) {
       const a = spawn(x, z, yaw, false, null, false);
@@ -750,7 +796,18 @@ export function buildCrowd(
       };
     },
     positions: () => [...agents.map((a) => a.pos), ...staticPositions],
-    update(dt, playerPos, panic) {
+    update(dt, playerPos, panic, traffic) {
+      // Only cars near the player can run anyone over the player can see, and
+      // only agents near the player are being simulated in the first place.
+      // Filtering the cars once per frame keeps this from being 616 x 423.
+      const near: VehicleBody[] = [];
+      for (const b of traffic) {
+        if (b.speed < RUN_OVER_MIN) continue;
+        if (Math.abs(b.position.x - playerPos.x) > 70) continue;
+        if (Math.abs(b.position.z - playerPos.z) > 70) continue;
+        near.push(b);
+      }
+
       for (const a of agents) {
         let moved = 0;
 
@@ -759,6 +816,7 @@ export function buildCrowd(
         if (a.dead) {
           const far = a.pos.distanceToSquared(playerPos) > CULL_DIST * CULL_DIST;
           a.cull.near = !far;
+          // A body in the road still gets driven over; it just does not care.
           if (a.dying >= 1) continue;
           a.dying = Math.min(1, a.dying + dt / DEATH_TIME);
           a.pos.y = groundHeight(a.pos.x, a.pos.z);
@@ -769,6 +827,22 @@ export function buildCrowd(
         }
 
         a.flinch = Math.max(0, a.flinch - dt / FLINCH_TIME);
+
+        /* ------------------------------------------------------- run-over */
+
+        for (const b of near) {
+          // A little pad: a pedestrian is not a point, and a car that visibly
+          // clips someone should hit them.
+          if (!insideBody(b, a.pos.x, a.pos.z, 0.35)) continue;
+          const f = Math.sin(b.yaw);
+          const c = Math.cos(b.yaw);
+          // Thrown the way the car is going.
+          const dirX = f * Math.sign(b.speed || 1);
+          const dirZ = c * Math.sign(b.speed || 1);
+          hit(a, Math.abs(b.speed) >= RUN_OVER_LETHAL ? 'kill' : 'hurt', dirX, dirZ, a.pos.y + 0.8);
+          break;
+        }
+        if (a.dead) continue;
 
         /* ---------------------------------------------------------- panic */
 

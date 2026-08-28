@@ -15,6 +15,11 @@ const COYOTE = 0.12;
 /** A jump pressed this long before landing still fires on touchdown. */
 const JUMP_BUFFER = 0.15;
 
+/** Hit at least this fast and she goes down rather than being shoved. */
+const KNOCK_SPEED = 4.5;
+/** How long a knockdown takes, start to back on her feet. */
+const KNOCK_TIME = 2.3;
+
 /** Deeper than this and she starts swimming. */
 const SWIM_ENTER_DEPTH = 1.2;
 /** Shallower than this and she finds her feet again. Hysteresis stops flicker. */
@@ -59,6 +64,18 @@ export class Controller {
    */
   faceYaw: number | null = null;
 
+  /**
+   * Being hit by a car: seconds left of the knockdown, counting down.
+   *
+   * While this is running she has no control at all. That is the point — a
+   * knockdown the player can steer out of is just a stumble, and the whole
+   * reason to keep out of the road is that a car takes the next two seconds
+   * away from you.
+   */
+  knocked = 0;
+  /** 0..1 through the knockdown, for the animator. */
+  knockT = 0;
+
   /** True once the water is deep enough to be out of her depth. */
   swimming = false;
   /** Depth of water underfoot, so the animator can wade convincingly. */
@@ -81,6 +98,25 @@ export class Controller {
     return this.vel.length();
   }
 
+  /**
+   * Hit by something moving. `force` is the closing speed in m/s.
+   *
+   * Below `KNOCK_SPEED` she is only shoved; above it she goes down and stays
+   * down for `KNOCK_TIME`.
+   */
+  knock(dirX: number, dirZ: number, force: number): void {
+    const shove = Math.min(9, force * 0.75);
+    this.vel.x += dirX * shove;
+    this.vel.y += dirZ * shove;
+    if (force < KNOCK_SPEED) return;
+    if (this.knocked > 0) return;
+    this.knocked = KNOCK_TIME;
+    this.knockT = 0;
+    // A little air off the bonnet, scaled by how hard it was.
+    this.vy = Math.min(4.2, 1.6 + force * 0.12);
+    this.grounded = false;
+  }
+
   /** Drop Mara at a new spot, e.g. stepping out of a car. */
   teleport(pos: THREE.Vector3, yaw: number): void {
     this.position.copy(pos);
@@ -92,9 +128,17 @@ export class Controller {
     this.turnRate = 0;
     this.groundY = groundHeight(pos.x, pos.z);
     this.position.y = this.groundY;
+    this.knocked = 0;
+    this.knockT = 0;
   }
 
   update(dt: number, cameraYaw: number): void {
+    if (this.knocked > 0) {
+      this.knocked = Math.max(0, this.knocked - dt);
+      this.knockT = 1 - this.knocked / KNOCK_TIME;
+      this.knockedUpdate(dt);
+      return;
+    }
     this.depth = waterDepth(this.position.x, this.position.z);
     // Hysteresis: a single threshold makes her flicker between wading and
     // swimming every time a wave passes.
@@ -227,6 +271,43 @@ export class Controller {
       }
       this.airHeight = this.position.y - this.groundY;
     }
+  }
+
+  /**
+   * Down, and getting up. No input, no steering — she slides to a stop and
+   * then stands.
+   */
+  private knockedUpdate(dt: number): void {
+    // Skid to a halt over the first half-second, then stay put.
+    const drag = this.grounded ? 6 : 0.6;
+    this.vel.multiplyScalar(Math.max(0, 1 - drag * dt));
+
+    const before = this.position.clone();
+    this.position.x += this.vel.x * dt;
+    this.position.z += this.vel.y * dt;
+    this.colliders.resolve(this.position, RADIUS, this.groundY);
+    this.distance = Math.hypot(this.position.x - before.x, this.position.z - before.z);
+
+    const target = groundHeight(this.position.x, this.position.z);
+    this.groundY = THREE.MathUtils.damp(this.groundY, target, 14, dt);
+
+    this.justLanded = false;
+    this.justJumped = false;
+    if (this.grounded) {
+      this.position.y = this.groundY;
+      this.airHeight = 0;
+    } else {
+      this.vy -= GRAVITY * dt;
+      this.position.y += this.vy * dt;
+      if (this.position.y <= this.groundY) {
+        this.position.y = this.groundY;
+        this.vy = 0;
+        this.grounded = true;
+        this.justLanded = true;
+      }
+      this.airHeight = this.position.y - this.groundY;
+    }
+    this.turnRate = 0;
   }
 
   /**

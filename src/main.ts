@@ -16,6 +16,7 @@ import { WeaponWheel } from './ui/weaponwheel';
 import { Arsenal, WeaponId } from './weapons';
 import { Audio } from './audio';
 import { groundHeight, waterDepth, SPAWN } from './world/layout';
+import { insideBody } from './world/traffic';
 import type { Drivable } from './world/cars';
 import type { Boat } from './world/boats';
 
@@ -115,6 +116,10 @@ const wheel = new WeaponWheel(
 
 /** Re-drawn on getting out of a car, so the gun survives a drive. */
 let stowed: WeaponId | null = null;
+
+// Car-to-car contact. Parked cars are in the shared collider set; moving
+// traffic is not, for the reasons in `world/traffic.ts`.
+vehicle.traffic = world.trafficBodies;
 
 const post = buildPost(renderer, scene, camera);
 post.setSize(innerWidth, innerHeight, Math.min(devicePixelRatio, 1.75));
@@ -463,6 +468,7 @@ renderer.domElement.addEventListener('click', () => {
   // Under automation pointer lock is never really held, so `Input` ignores
   // every mouse event. Driving the weapons from a script means forcing this.
   input,
+  insideBody,
   getMode: () => mode,
   enterNearestCar: () => {
     const c = nearestCar();
@@ -473,8 +479,30 @@ renderer.domElement.addEventListener('click', () => {
 
 /* ------------------------------------------------------------------ loop */
 
+/**
+ * How far to tip the rig root over during a knockdown.
+ *
+ * Pitched flat almost at once, held there, then brought upright over the last
+ * quarter as she gets up. Zero whenever she is on her feet, so the ordinary
+ * walk is never touched.
+ */
+function knockPitch(t: number, knocked: number): number {
+  if (knocked <= 0) return 0;
+  const down = t < 0.18 ? t / 0.18 : t > 0.72 ? Math.max(0, 1 - (t - 0.72) / 0.28) : 1;
+  return -(Math.PI / 2) * 0.82 * down;
+}
+
 const cameraRight = new THREE.Vector3();
 const aimDir = new THREE.Vector3();
+/** Scratch footprint for the player's car, reused every frame. */
+const runOver = {
+  position: new THREE.Vector3(),
+  yaw: 0,
+  halfLength: 2.4,
+  halfWidth: 0.95,
+  speed: 0,
+  taken: false,
+};
 const shadowVolume = new THREE.Frustum();
 
 /**
@@ -551,6 +579,34 @@ function frame(): void {
       }
     }
 
+    // Driving through people. The car's own footprint, tested against the crowd
+    // — they are not in the collider set, so nothing here stops the car.
+    if (mode === 'driving' && vehicle.car) {
+      const spec = vehicle.car.build.spec;
+      runOver.position = vehicle.position;
+      runOver.yaw = vehicle.yaw;
+      runOver.halfLength = spec.length * 0.5;
+      runOver.halfWidth = spec.width * 0.5;
+      const kph = Math.abs(vehicle.speed);
+      if (kph > 1.5) {
+        const dirX = Math.sin(vehicle.yaw) * Math.sign(vehicle.speed);
+        const dirZ = Math.cos(vehicle.yaw) * Math.sign(vehicle.speed);
+        const people = world.people;
+        for (let i = 0; i < people.length; i++) {
+          const p = people[i];
+          if (p.dead) continue;
+          if (Math.abs(p.position.x - vehicle.position.x) > 4) continue;
+          if (Math.abs(p.position.z - vehicle.position.z) > 4) continue;
+          if (!insideBody(runOver, p.position.x, p.position.z, 0.3)) continue;
+          if (world.runOverPerson(i, kph, dirX, dirZ)) {
+            audio.impact(Math.min(1, kph / 16));
+            // A body costs the car a little, but nothing like a wall.
+            vehicle.scrubOnImpact(0.93);
+          }
+        }
+      }
+    }
+
     if (mode === 'boating') {
       boat.update(dt);
       chase.setAutoAlign(boat.yaw, Math.min(1.8, Math.abs(boat.speed) * 0.2));
@@ -588,10 +644,28 @@ function frame(): void {
       // Hold the camera's heading and strafe around it while aiming.
       controller.faceYaw = aiming ? chase.yaw : null;
 
+      // Run over on foot. Only cars close enough to matter are tested; the
+      // player is one point, so this is a handful of rectangle tests a frame.
+      if (controller.knocked <= 0) {
+        for (const b of world.trafficBodies) {
+          if (b.taken || b.speed < 2) continue;
+          if (Math.abs(b.position.x - controller.position.x) > 6) continue;
+          if (Math.abs(b.position.z - controller.position.z) > 6) continue;
+          if (!insideBody(b, controller.position.x, controller.position.z, 0.3)) continue;
+          const s = Math.sign(b.speed) || 1;
+          controller.knock(Math.sin(b.yaw) * s, Math.cos(b.yaw) * s, Math.abs(b.speed));
+          audio.impact(Math.min(1, Math.abs(b.speed) / 14));
+          break;
+        }
+      }
+
       controller.update(dt, chase.yaw);
 
       rig.root.position.copy(controller.position);
       rig.root.rotation.y = controller.yaw;
+      // The animator owns the joints; which way up she is lying is the caller's
+      // job, the same split the crowd's collapse uses.
+      rig.root.rotation.x = knockPitch(controller.knockT, controller.knocked);
 
       animator.update(dt, {
         speed: controller.speed,
@@ -608,6 +682,7 @@ function frame(): void {
         aimPitch: chase.pitch,
         twoHanded: spec ? spec.twoHanded : false,
         reload: arsenal.reloadProgress,
+        knocked: controller.knocked > 0 ? controller.knockT : 0,
       });
 
       chase.update(dt, controller.position, controller.speed, GAIT.runSpeed);
