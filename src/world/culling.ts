@@ -65,6 +65,8 @@ export interface Cullable {
    * only ever one writer.
    */
   near: boolean;
+  /** Draw range in metres — see `Culler.addStatic`. Unset means unlimited. */
+  maxDistance?: number;
 }
 
 export class Culler {
@@ -72,8 +74,15 @@ export class Culler {
   private readonly view = new THREE.Frustum();
   private readonly m = new THREE.Matrix4();
   private readonly sphere = new THREE.Sphere();
+  private readonly eye = new THREE.Vector3();
   /** Fixed centres for things whose `position` is not where their geometry is. */
-  private readonly statics: Array<{ object: THREE.Object3D; centre: THREE.Vector3; radius: number }> = [];
+  private readonly statics: Array<{
+    object: THREE.Object3D;
+    centre: THREE.Vector3;
+    radius: number;
+    /** Squared draw range, or Infinity. */
+    range: number;
+  }> = [];
 
   /**
    * Register a mover. Its `position` is read fresh every frame, and its owner
@@ -87,12 +96,22 @@ export class Culler {
   /**
    * Register something that never moves. Baked chunks sit at the origin with
    * their geometry spread across a whole block, so they carry explicit bounds.
+   *
+   * @param maxDistance Stop drawing this subtree past this range, in metres.
+   *   Only for chunks whose *contents* are small — bins, café chairs, kerbside
+   *   cars — because it is the contents that have to be too small to miss, not
+   *   the chunk. Leave it off for anything with a building in it: the whole
+   *   block vanishes at once and the skyline grows a hole.
    */
-  addStatic(object: THREE.Object3D, bounds: THREE.Box3): void {
+  addStatic(object: THREE.Object3D, bounds: THREE.Box3, maxDistance?: number): void {
     if (bounds.isEmpty()) return;
     const centre = bounds.getCenter(new THREE.Vector3());
     const radius = bounds.getSize(new THREE.Vector3()).length() * 0.5;
-    this.statics.push({ object, centre, radius });
+    // Measured from the chunk's near face, not its centre, or a 60 m-wide chunk
+    // disappears while the corner nearest the camera is still 30 m closer than
+    // the range says.
+    const range = maxDistance === undefined ? Infinity : (maxDistance + radius) ** 2;
+    this.statics.push({ object, centre, radius, range });
   }
 
   /**
@@ -105,16 +124,24 @@ export class Culler {
       this.m.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse),
     );
     const sphere = this.sphere;
+    // The eye, for the range tests below. Dropping something for being far away
+    // can never change a shadow: the sun's shadow box is 64 m across, so
+    // anything past ~45 m is already outside it and casts nothing.
+    const eye = this.eye.setFromMatrixPosition(camera.matrixWorld);
 
     for (const it of this.statics) {
       sphere.center.copy(it.centre);
       sphere.radius = it.radius;
       it.object.visible =
-        this.view.intersectsSphere(sphere) || (shadow !== null && shadow.intersectsSphere(sphere));
+        eye.distanceToSquared(it.centre) < it.range &&
+        (this.view.intersectsSphere(sphere) || (shadow !== null && shadow.intersectsSphere(sphere)));
     }
 
     for (const it of this.items) {
       let on = it.near;
+      if (on && it.maxDistance !== undefined) {
+        on = eye.distanceToSquared(it.object.position) < it.maxDistance * it.maxDistance;
+      }
       if (on) {
         sphere.center.copy(it.object.position);
         sphere.radius = it.radius;

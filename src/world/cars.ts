@@ -543,49 +543,66 @@ export function bakeVehicle(build: CarBuild, parkable = false): CarBuild {
   const wheels = build.wheels as THREE.Group[];
   for (const w of wheels) w.removeFromParent();
 
-  const out = new THREE.Group();
-  hoist(bakeStatic(build.group), out);
-
-  // A wheel is four meshes — tyre, rim, spokes, disc — and four wheels is two
-  // thirds of the car's draw calls. A *parked* car's wheels never turn, so they
-  // do not need to be four separate pivots: merged into one group they cost
-  // four draws instead of sixteen, and look identical because nothing moves.
-  //
-  // Only the car being driven needs the articulated form, and there is never
-  // more than one of those, so the two forms swap on entry and exit. Traffic
-  // rolls constantly and is built without a parked form at all.
-  let still: THREE.Group | null = null;
-  if (parkable) {
-    const holder = new THREE.Group();
-    for (const w of wheels) holder.add(w.clone(true));
-    still = new THREE.Group();
-    hoist(bakeStatic(holder), still);
-    out.add(still);
-  }
-
+  // A wheel is four meshes — tyre, rim, spokes, disc — so four of them are two
+  // thirds of the car's draw calls. Each merges into its own pivot, which is
+  // what lets the front pair steer and all four spin. `bakeStatic` returns
+  // geometry relative to its root, so the merged wheel lands in the pivot's
+  // local space with the axle still on Z.
   const pivots = wheels.map((w) => {
     const pivot = new THREE.Group();
     pivot.position.copy(w.position);
-    // bakeStatic returns geometry relative to its root, so the merged wheel
-    // lands in the pivot's local space with the axle still on Z.
     hoist(bakeStatic(w), pivot);
-    pivot.visible = !parkable;
-    out.add(pivot);
     return pivot;
   });
 
-  const parked = still;
+  const out = new THREE.Group();
+
+  // Traffic rolls constantly, so it only ever needs the articulated form.
+  if (!parkable) {
+    hoist(bakeStatic(build.group), out);
+    for (const p of pivots) out.add(p);
+    return { group: out, wheels: pivots, kind: build.kind, spec: build.spec };
+  }
+
+  /* ------------------------------------------------------- parked form */
+
+  // Body on its own, for when this car is the one being driven. Held detached:
+  // 236 parked cars carrying an unused second body is 236 subtrees that
+  // `updateMatrixWorld` would walk every frame for nothing.
+  const rollingBody = new THREE.Group();
+  hoist(bakeStatic(build.group), rollingBody);
+
+  // A *parked* car's wheels never turn, so they do not have to be separate
+  // objects at all — baked into the body they merge into its own material
+  // buckets, and a wheel's chrome, tyre black and hub gold are all colours the
+  // body is already drawing. Four extra draw calls become zero, which across
+  // the kerbside cars in view on Ocean Drive is ~240 of them.
+  //
+  // Only the car being driven needs the articulated form, and there is never
+  // more than one of those, so the two forms swap on entry and exit.
+  for (const w of wheels) build.group.add(w);
+  hoist(bakeStatic(build.group), out);
+  const parkedBody = [...out.children];
+
+  let rolling = false;
   return {
     group: out,
     wheels: pivots,
     kind: build.kind,
     spec: build.spec,
-    setRolling: parked
-      ? (on) => {
-          parked.visible = !on;
-          for (const p of pivots) p.visible = on;
-        }
-      : undefined,
+    setRolling: (on) => {
+      if (on === rolling) return;
+      rolling = on;
+      if (on) {
+        for (const m of parkedBody) m.removeFromParent();
+        for (const m of rollingBody.children.slice()) out.add(m);
+        for (const p of pivots) out.add(p);
+      } else {
+        for (const p of pivots) p.removeFromParent();
+        for (const m of out.children.slice()) rollingBody.add(m);
+        for (const m of parkedBody) out.add(m);
+      }
+    },
   };
 }
 

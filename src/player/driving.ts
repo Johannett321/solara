@@ -65,9 +65,9 @@ export class VehicleController {
   enter(car: Drivable): void {
     this.car = car;
     car.occupied = true;
-    // Swap in the articulated wheels. Parked cars carry a single merged set —
-    // see `bakeVehicle` — which is a third of the draw calls and identical to
-    // look at right up until they have to turn.
+    // Swap in the articulated body. A parked car has its wheels baked into the
+    // body as one merged set — see `bakeVehicle` — which is identical to look
+    // at right up until they have to turn, and costs four fewer draw calls.
     car.build.setRolling?.(true);
     // The parked footprint would otherwise block the car it belongs to.
     car.collider.disable();

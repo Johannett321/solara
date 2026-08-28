@@ -88,6 +88,16 @@ means writing a builder function, not importing a file.
   Generating a texture per colour variant is the main way to accidentally add
   seconds of load time.
 
+**Baking the textures out to files is not a load-time fix**, which is the first
+thing everyone reaches for. Measured on the production build: 8.7 s to a
+playable frame, of which `buildWorld` is 7.4 s and *all* texture generation is
+0.18 s — 2%. The whole game is a 310 kB gzipped download against 167 MB of
+generated texture memory, so shipping those as files trades a fifth of a second
+of CPU for tens of megabytes over the wire. The load cost is geometry
+construction, and it sits in the same three places as the frame cost: the crowd
+(2.2 s), traffic (1.4 s) and cars (1.2 s). Generate less, or build them after
+the player can move — don't move them to disk.
+
 ### `world/layout.ts` is the single source of truth
 
 The street grid (`AVENUES`, `CROSS_STREETS`), the beachfront dimensions *and*
@@ -138,7 +148,40 @@ smearing the frame.
 actually threaded through. `util/loft.ts`'s `limb()` takes a `res` argument for
 this, and the head skull and shoes branch on `hero`. Adding a rig part at fixed
 resolution costs ~400 pedestrians' worth of geometry across the city: leaving
-`limb()` unscaled alone was 7M triangles.
+`limb()` unscaled alone was 7M triangles, and the hair and jewellery sat at
+full resolution for a long time for exactly that reason — the hair mass alone
+was 2154 of a pedestrian's 17924 triangles, more than the rest of her head.
+**Any new rig part must go through `R()`,** in `buildMara` and `buildHead`
+alike.
+
+`RigOptions.skinned` then collapses the finished rig into one SkinnedMesh —
+`player/skin.ts`. Every mesh in the rig is already rigid inside exactly one
+joint, so binding its vertices to that joint with weight 1 is the same
+transform chain moved onto the GPU: the pose is identical to the pixel, and 40
+draw calls become one per material (about 11), twice over with the shadow pass.
+Measured on Ocean Drive that was 33.5 ms to 27.6 ms — 30 fps to 36.
+
+Three things about it are load-bearing:
+
+- **The skeleton is captured at the rest pose**, because `Skeleton` reads each
+  joint's inverse bind matrix from its current `matrixWorld`. This is why the
+  posed sunbathers and diners are *not* skinned: `poseSeated` and friends run
+  after `buildMara` returns, and a skeleton bound before them would hold the
+  standing pose. They never animate, so the bake is the better answer anyway.
+- **Geometry is baked into root-local space and the SkinnedMesh is parented to
+  the root with an identity transform.** three recomputes `bindMatrixInverse`
+  from `matrixWorld` every frame, so the root's own motion cancels and the
+  agent can still be walked around the world by writing `root.position`.
+- **The joints stay ordinary `THREE.Group`s.** `Skeleton` only ever reads
+  `matrixWorld` off its bones, so nothing has to become a `THREE.Bone` and the
+  animator, `MaraRig` and the crowd's posing code are untouched.
+
+The skinned body sets `frustumCulled = false` on purpose: `world/culling.ts` is
+the single writer of a pedestrian's visibility and already tests one enclosing
+sphere against the view frustum and the sun's shadow volume. Handing three a
+bounding sphere so it can re-test was measured at 5349 draws against 5321, and
+slightly slower — and letting `SkinnedMesh.computeBoundingSphere` work it out
+walks every vertex on the CPU.
 
 ### Conventions that have caused repeat bugs
 
@@ -296,11 +339,19 @@ the same kerb would park them inside each other. The bake preserves `position`,
 `normal`, `uv` and `color`; dropping `color` renders vertex-coloured materials
 (the beach umbrellas) black.
 
-A *parked* car's wheels never turn, so `bakeVehicle(build, true)` gives it a
-second, merged set of all four — twelve draws instead of twenty-four — and
-`player/driving.ts` swaps the articulated pivots in on `enter` and back out on
-`exit`. Only one car is ever being driven. Traffic rolls constantly and is built
-without the parked form.
+A *parked* car's wheels never turn, so `bakeVehicle(build, true)` bakes them
+*into the body* rather than keeping them as objects — a wheel's chrome, tyre
+black and hub gold are all colours the body is already drawing, so four draws
+become zero and a parked car is 11 meshes instead of 28. `player/driving.ts`
+swaps in the articulated form on `enter` and back on `exit`; the pivots and the
+body-only bake are held **detached from the scene graph** while parked, or 236
+cars would each carry a spare subtree for `updateMatrixWorld` to walk. Only one
+car is ever being driven. Traffic rolls constantly and is built without the
+parked form.
+
+`setRolling` must be idempotent — it is called on every `enter` and `exit`, and
+a second identical call that re-parented the same meshes would double the car up
+or strip it bare.
 
 ### Culling, and the two walks a frame costs
 
@@ -317,7 +368,12 @@ before anything was drawn.
 
 `world/culling.ts` switches whole subtrees off with one sphere test each —
 per parked car, per pedestrian, per traffic car, per baked chunk — so three never
-visits their contents. Three rules keep it from changing a pixel:
+visits their contents. **This is the single biggest optimisation in the
+project**: forcing every group back on and measuring took the frame from 26.8 ms
+to 97.5 ms, 37 fps to 10. Anyone proposing "only draw what's in front of the
+camera" is proposing this, and it is already here.
+
+Three rules keep it from changing a pixel:
 
 - The sphere must **enclose** the subtree. three still does the exact per-mesh
   test on whatever survives, so generous radii cost nothing.
@@ -326,6 +382,33 @@ visits their contents. Three rules keep it from changing a pixel:
   everything just out of frame.
 - Crowd and traffic write their own range rule to `Cullable.near` instead of to
   `visible`, so there is only ever one writer.
+
+**Draw ranges are the other half.** The frustum test does nothing about the
+things that are dead ahead and 300 m away, and measured down Ocean Drive, 58% of
+the draw calls in frame were beyond 200 m — mostly café chairs, bins, planters
+and kerbside cars, each a couple of pixels at that range. `Cullable.maxDistance`
+and the third argument to `addStatic` cut those; the constants live in one
+`RANGE` block in `world/index.ts`.
+
+The rule for setting one is **the size of the things inside the chunk, never the
+size of the chunk**. `citydress` is a 44 m-radius chunk full of 1 m objects and
+cuts at 150 m; `city` is a 60 m chunk with towers in it and gets no range at all,
+because dropping one takes a piece out of the skyline. Ranges are measured from
+the chunk's near face (`maxDistance + radius`), or a wide chunk vanishes while
+its nearest corner is still well inside the range.
+
+Two things make this safe, and both are worth knowing before touching it:
+
+- **A draw range can never change a shadow.** The sun's shadow box is 64 m
+  across, so anything past ~45 m is already outside it and casts nothing.
+- Verified by freezing the simulation (`world.update` and `clouds.update` to
+  no-ops — traffic moves far enough in 100 ms to swamp the measurement
+  otherwise), then diffing the frame with and without the rule, and separately
+  diffing against everything in a 14 m band past each boundary switched on —
+  what pops the instant the player steps over the line. Both came back at 0.04%
+  of pixels differing strongly, which is the same as the noise floor from Mara's
+  own idle breathing. Mask the fps readout and the location caption when
+  repeating this; they are DOM, and they dominate the diff otherwise.
 
 **`matrixWorldAutoUpdate = false` does not do what it looks like it does.** three
 skips the matrix multiply but still recurses into every child, so a frozen city
@@ -418,9 +501,28 @@ rest are scenery merged into the street; rain has no splashes, puddles or
 run-off, and only the city road and pavement materials go wet, so the beach and
 the promenade stay dry-looking in a downpour; nobody takes shelter from it.
 
-Frame rate is still bounded by draw calls — roughly 5000 in the beauty pass on
-Ocean Drive, at ~5 µs each on this driver. The remaining big spenders are the
-city chunks, the parked cars and the crowd, and none of them can be cut further
-without a visible change: pedestrians are 40 loose meshes because every limb
-moves independently (a SkinnedMesh would fix it), and distance culling anything
-on the strip pops in plain sight.
+Frame rate is still bounded by draw calls, at ~5 µs each on this driver: about
+3550 in the beauty pass on Ocean Drive (45 fps) and 5800 looking inland from the
+beach (31 fps), which is the worst vantage in the world.
+
+GTAO is 5.8 ms of that and is **not** tunable — dropping its sample count from 8
+to 4 made the frame *slower*, and shortening its camera from 120 m to 15 m won
+0.8 ms, because the cost is submitting the scene a second time for the normal
+buffer rather than the AO shader itself. The shadow map is another ~6 ms; its
+2048 map and 64 m box are already tight, and halving the map changed nothing
+(fill is nearly free here — quartering the framebuffer moves the frame under
+5%). Bloom, the grade and SMAA together are about 1 ms.
+
+**The next real lever is splitting `city:chunked` in two.** It is the largest
+group with no draw range, and it cannot have one as it stands, because its
+chunks hold towers. But most of its draws are `world/facades.ts` — shopfronts,
+awnings, blade signs, balconies, fire escapes, rooftop clutter — none of which
+resolves at 200 m. Baking the building shells and the street-level kit into
+*separate* chunk groups would let the detail take a 150 m range while the
+skyline keeps drawing to the horizon.
+
+After that: traffic is 621 cars at 24 meshes across only 20 distinct materials,
+which wants InstancedMesh and would take 1.4 s off the load as well. Note that
+merging *across* agents is not the win it looks like — baking parked cars into
+street chunks trades per-car culling for chunk culling and measured at 0.5 ms,
+a quarter of what collapsing each car individually gets.

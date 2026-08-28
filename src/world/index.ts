@@ -48,6 +48,35 @@ export interface World {
 /** Chunk size for baking, in metres along the street. */
 const CHUNK = 40;
 
+/**
+ * Draw ranges for the chunk groups whose *contents* are small, in metres.
+ *
+ * Measured looking down Ocean Drive, 58% of the draw calls in frame were more
+ * than 200 m away, and most of that is clutter: café chairs, bins, planters and
+ * kerbside cars, each a couple of pixels at that range. Cutting them is worth
+ * roughly a third of the beauty pass.
+ *
+ * What is deliberately *not* here is anything containing a building —
+ * `city`, `buildings`, `harbour`, `props` (the palms) and the ground surfaces.
+ * A city chunk is 60 m across and holds towers; dropping one takes a piece out
+ * of the skyline and is obvious from a kilometre away. The rule of thumb is the
+ * size of the things inside the chunk, never the size of the chunk.
+ */
+const RANGE = {
+  /** Bins, benches, café tables, bikes, planters, litter. */
+  citydress: 150,
+  /** Kerbside scenery cars, merged into the street. */
+  cityparking: 190,
+  /** Sunbathers and diners, posed and baked. */
+  posedCrowd: 150,
+} as const;
+
+/**
+ * Parked cars the player can enter. Longer than the scenery cars they sit
+ * beside, because a drivable one is the thing you walk toward on purpose.
+ */
+const PARKED_CAR_RANGE = 230;
+
 const chunkByZ = (o: THREE.Object3D) => Math.floor(o.position.z / CHUNK);
 
 /**
@@ -66,9 +95,9 @@ export function buildWorld(): World {
   // whole world has been placed, frozen: their matrices never change again, and
   // each chunk gets a bounding sphere so the culler can drop the whole block in
   // one test instead of three visiting every mesh inside it.
-  const chunked: THREE.Group[] = [];
-  const chunks = (g: THREE.Group): THREE.Group => {
-    chunked.push(g);
+  const chunked: Array<{ group: THREE.Group; range?: number }> = [];
+  const chunks = (g: THREE.Group, range?: number): THREE.Group => {
+    chunked.push({ group: g, range });
     return g;
   };
 
@@ -89,7 +118,7 @@ export function buildWorld(): World {
   const cars: CarsResult = buildCars(colliders);
   group.add(cars.group);
   // The kerbside cars that are scenery only do get merged into the street.
-  group.add(chunks(bakeChunked(cars.staticGroup, chunkByCell)));
+  group.add(chunks(bakeChunked(cars.staticGroup, chunkByCell), RANGE.cityparking));
 
   // Seaward half of the map: park, dune, beach, seabed, then the ocean itself.
   const terrain = buildTerrain();
@@ -108,7 +137,7 @@ export function buildWorld(): World {
   group.add(chunks(bakeChunked(city.group, chunkByCell)));
 
   // Street-level dressing: bins, benches, cafés, bikes, planters, litter.
-  group.add(chunks(bakeChunked(buildCityDress(colliders), chunkByCell)));
+  group.add(chunks(bakeChunked(buildCityDress(colliders), chunkByCell), RANGE.citydress));
 
   // Green belt between the sand and the promenade.
   group.add(chunks(bakeChunked(buildPark(colliders), chunkByZ)));
@@ -122,7 +151,7 @@ export function buildWorld(): World {
 
   const crowd: Crowd = buildCrowd(colliders, beach);
   group.add(crowd.group);
-  chunks(crowd.posed);
+  chunks(crowd.posed, RANGE.posedCrowd);
 
   const traffic: Traffic = buildTraffic();
   group.add(traffic.group);
@@ -133,6 +162,9 @@ export function buildWorld(): World {
 
   /* ------------------------------------------------------------- culling */
 
+  // Parked cars carry no range rule of their own — they never move and never
+  // run an update — so the draw range is applied here.
+  for (const c of cars.cullable) c.maxDistance = PARKED_CAR_RANGE;
   for (const c of [...cars.cullable, ...crowd.cullable, ...traffic.cullable]) {
     culler.track(c);
   }
@@ -143,8 +175,8 @@ export function buildWorld(): World {
   // render list; only the matrices are settled.
   group.updateMatrixWorld(true);
   const bounds = new THREE.Box3();
-  for (const g of chunked) {
-    for (const chunk of g.children) culler.addStatic(chunk, bounds.setFromObject(chunk));
+  for (const { group: g, range } of chunked) {
+    for (const chunk of g.children) culler.addStatic(chunk, bounds.setFromObject(chunk), range);
     freezeMatrices(g);
   }
   freezeMatrices(terrain.group);
