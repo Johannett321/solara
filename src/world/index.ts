@@ -18,6 +18,7 @@ import { buildOcean, Ocean } from '../render/water';
 import { bakeChunked } from '../util/bake';
 import { Culler, freezeMatrices } from './culling';
 import { WORLD_MAX_X, WORLD_MIN_Z, WORLD_MAX_Z, OCEAN_EDGE } from './layout';
+import type { HitZone, PersonTarget } from '../weapons/ballistics';
 
 export interface World {
   group: THREE.Group;
@@ -30,6 +31,12 @@ export interface World {
   footprints: Footprint[];
   /** Live pedestrian positions, for the map overlay. */
   crowdPositions(): THREE.Vector3[];
+  /** Shootable pedestrians — see `weapons/ballistics.ts`. Held by reference. */
+  people: PersonTarget[];
+  /** Put a round into person `index`, from a shot travelling `dirX,dirZ`. */
+  shootPerson(index: number, zone: HitZone, dirX: number, dirZ: number, hitY: number): void;
+  /** Agent state for `window.SOLARA` — see `Crowd.debug`. */
+  personDebug(index: number): Record<string, unknown> | null;
   /**
    * Everything a bullet can hit that is not the ground or a collider: parked
    * cars, moving traffic and moored boats.
@@ -205,6 +212,9 @@ export function buildWorld(): World {
     targets,
     footprints: [...buildings.footprints, ...city.footprints],
     crowdPositions: () => crowd.positions(),
+    people: crowd.people,
+    shootPerson: (i, zone, dirX, dirZ, hitY) => crowd.shoot(i, zone, dirX, dirZ, hitY),
+    personDebug: (i) => crowd.debug(i),
     waterHeight: (x, z) => ocean.heightAt(x, z),
     setNight(f) {
       setFacadeNight(f);

@@ -83,8 +83,13 @@ export class WeaponFx {
       blending: THREE.AdditiveBlending,
       toneMapped: true,
     });
-    // A unit-length box along -Z, so a tracer is one scale and one lookAt.
-    const beam = new THREE.BoxGeometry(0.028, 0.028, 1).translate(0, 0, -0.5);
+    // A unit-length box along **+Z**, because `Object3D.lookAt` is not the
+    // camera's. `Matrix4.lookAt(eye, target, up)` puts +Z on target→eye, and
+    // `Object3D.lookAt` passes those arguments *reversed* for anything that is
+    // not a camera or a light — so a plain mesh ends up with its +Z pointing at
+    // the target where a camera would point its -Z. Built along -Z, every
+    // tracer drew from the muzzle backwards past the player.
+    const beam = new THREE.BoxGeometry(0.028, 0.028, 1).translate(0, 0, 0.5);
     for (let i = 0; i < TRACERS; i++) {
       const m = new THREE.Mesh(beam, this.tracerMat);
       m.visible = false;

@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { Rng } from '../core/rng';
 import { buildMara, Look, RigOptions, MaraRig, P } from '../player/rig';
-import { MaraAnimator } from '../player/animator';
+import { MaraAnimator, LocomotionState } from '../player/animator';
 import { Colliders } from './collision';
 import { bakeChunked } from '../util/bake';
 import type { Cullable } from './culling';
@@ -19,6 +19,7 @@ import {
   riverInfluence,
 } from './layout';
 import type { BeachResult } from './beach';
+import type { HitZone, PersonTarget } from '../weapons/ballistics';
 
 /* ------------------------------------------------------------------ looks */
 
@@ -190,7 +191,92 @@ function poseLounging(rig: MaraRig, rng: Rng): void {
   }
 }
 
+/**
+ * Fold a shot pedestrian to the ground over `t` in 0..1.
+ *
+ * Not a ragdoll — there is no physics here to hang one on, and a scripted
+ * collapse is both cheaper and more legible at the distance these are seen
+ * from. The order is what sells it: the knees go first and the body follows,
+ * because a figure that pitches over rigid reads as a falling plank.
+ *
+ * `back` is which way they go, taken from the shot direction, so a round from
+ * behind puts them on their face.
+ */
+function poseCollapse(rig: MaraRig, t: number, back: number, side: number, groundY: number): void {
+  const k = Math.min(1, t);
+  // Ease out: fast at the start, settling into the ground.
+  const e = 1 - (1 - k) * (1 - k);
+
+  // The legs give way first, and then straighten out again as the body
+  // settles. Held bent, the knees end up pointing at the sky and the body reads
+  // as a chair rather than a corpse — so the buckle is a transient that peaks
+  // early and decays, with only a little sprawl left at rest.
+  const buckle = Math.sin(Math.min(1, k * 1.5) * Math.PI);
+  for (const [leg, s] of [
+    [rig.legL, 1],
+    [rig.legR, -1],
+  ] as const) {
+    leg.hip.rotation.x = -0.5 * buckle - 0.05 * e;
+    leg.knee.rotation.x = 1.5 * buckle + 0.12 * e;
+    leg.hip.rotation.z = s * (0.12 * buckle + 0.15 * e);
+    leg.ankle.rotation.x = 0.3 * buckle + 0.1 * e;
+  }
+
+  // Then the whole body tips over, pivoting about the feet where the root sits.
+  //
+  // The pelvis must NOT be pulled down `hips.position.y` to do this. That axis
+  // is the body's own up, and a quarter turn later it is pointing along the
+  // ground — dropping the pelvis 'down' it telescopes the character into
+  // itself. The rotation does the work; the root only has to rise by half a
+  // body's thickness so the finished pose rests on the pavement rather than
+  // half inside it.
+  rig.root.rotation.x = back * (Math.PI / 2) * e;
+  rig.root.rotation.z = side * 0.14 * e;
+  rig.root.position.y = groundY + LYING_HEIGHT * e;
+  rig.hips.position.y = P.hipY;
+
+  // Arms fly out and then flop, ending spread on the ground rather than raised.
+  const fling = Math.sin(Math.min(1, k * 1.6) * Math.PI);
+  for (const [arm, sgn] of [
+    [rig.armL, 1],
+    [rig.armR, -1],
+  ] as const) {
+    arm.shoulder.rotation.x = -0.3 * fling + 0.12 * e;
+    arm.shoulder.rotation.z = sgn * (0.3 * fling + 0.6 * e);
+    arm.elbow.rotation.x = -0.6 * fling - 0.22 * e;
+  }
+
+  rig.spine.rotation.x = 0.12 * e - 0.35 * fling;
+  rig.chest.rotation.x = 0.06 * e;
+  rig.head.rotation.x = -0.25 * e;
+  rig.head.rotation.y = 0;
+  rig.head.rotation.z = 0;
+}
+
 /* ------------------------------------------------------------------ agent */
+
+/**
+ * How a survivor carries a body hit.
+ *
+ * Picked from where the round landed relative to the body, and then permanent:
+ * a pedestrian who has been shot keeps walking wrong for the rest of the
+ * session, which is the whole point of the state existing.
+ */
+export type Injury = 'none' | 'leg' | 'arm' | 'gut';
+
+/** Body shots a pedestrian survives. A head shot is always fatal. */
+const BODY_HITS_TO_KILL = 3;
+/** Seconds the flinch takes to play out. */
+const FLINCH_TIME = 0.42;
+/** Seconds the collapse takes. */
+const DEATH_TIME = 0.95;
+/**
+ * How high the rig root sits once a body is flat, in metres.
+ *
+ * With the root pitched a quarter turn the body extends horizontally from it,
+ * so this is simply half the thickness of a person lying down.
+ */
+const LYING_HEIGHT = 0.16;
 
 interface Agent {
   rig: MaraRig;
@@ -215,12 +301,51 @@ interface Agent {
   bob: number;
   /** This agent's entry in the culler; `near` is the range rule below. */
   cull: Cullable;
+
+  /* ------------------------------------------------------------ damage */
+
+  /** Body shots absorbed so far. */
+  wounds: number;
+  /** 0 until shot, then counts up through `DEATH_TIME` and stops at 1. */
+  dying: number;
+  dead: boolean;
+  /** 1 the instant a round lands, decaying over `FLINCH_TIME`. */
+  flinch: number;
+  /** Lateral component of the shot in the agent's own frame, -1..1. */
+  flinchSide: number;
+  /** Set on the frame a head shot lands, so the flinch reads differently. */
+  flinchHead: boolean;
+  injury: Injury;
+  /** Which side the limp or the held arm is on. */
+  injurySide: number;
+  /** Which way they fold, set from the shot that killed them. */
+  deathBack: number;
+  deathSide: number;
+  /** This agent's row in the shootable list. */
+  target: PersonTarget;
 }
 
 export interface Crowd {
   group: THREE.Group;
   /** One entry per live pedestrian, for group-level culling. */
   cullable: Cullable[];
+  /**
+   * Shootable pedestrians, as head and body spheres. Built once and held by
+   * reference, so `weapons/ballistics.ts` can walk it without allocating.
+   */
+  people: PersonTarget[];
+  /**
+   * Put a round into person `index`. The index comes back from the trace.
+   *
+   * @param dirX,dirZ The shot direction, for which way they fold.
+   */
+  shoot(index: number, zone: HitZone, dirX: number, dirZ: number, hitY: number): void;
+  /**
+   * Agent state, for `window.SOLARA`. Reaction poses are hard to tell apart by
+   * eye at pedestrian distance — a raised arm can be a flinch, a cradled wound
+   * or the ordinary walk swing — so the state has to be readable directly.
+   */
+  debug(index: number): Record<string, unknown> | null;
   /** The posed sunbathers and diners, baked. Chunked, so it culls per chunk. */
   posed: THREE.Group;
   /** Live pedestrian positions, for the map overlay. */
@@ -240,6 +365,9 @@ export function buildCrowd(colliders: Colliders, beach: BeachResult): Crowd {
   const rng = new Rng(24601);
   const agents: Agent[] = [];
   const cullable: Cullable[] = [];
+  // Parallel to `agents`: one row per live pedestrian, in the same order, so
+  // the index a trace returns indexes both.
+  const people: PersonTarget[] = [];
 
   /**
    * Sunbathers, diners and anyone else posed once and left alone never move a
@@ -293,8 +421,34 @@ export function buildCrowd(colliders: Colliders, beach: BeachResult): Crowd {
     const cull: Cullable = { object: rig.root, radius: 2.2, near: true };
     cullable.push(cull);
 
+    // Hit spheres, scaled with the figure. The crowd varies height by ±10%, and
+    // a fixed head sphere sits in the neck of the tall ones and over the hair of
+    // the short ones. Heights are joint heights from `player/rig.ts` plus the
+    // skull's own centre.
+    const scale = rig.root.scale.y;
+    const target: PersonTarget = {
+      position: pos,
+      headY: (P.hipY + P.spineY + P.chestH + P.neckH + 0.12) * scale,
+      headR: 0.15 * scale,
+      bodyY: (P.hipY + 0.16) * scale,
+      bodyR: 0.36 * scale,
+      dead: false,
+    };
+    people.push(target);
+
     const a: Agent = {
       cull,
+      target,
+      wounds: 0,
+      dying: 0,
+      dead: false,
+      flinch: 0,
+      flinchSide: 0,
+      flinchHead: false,
+      injury: 'none',
+      injurySide: 1,
+      deathBack: 1,
+      deathSide: 1,
       rig,
       anim: new MaraAnimator(rig),
       pos,
@@ -476,7 +630,7 @@ export function buildCrowd(colliders: Colliders, beach: BeachResult): Crowd {
 
   /* ----------------------------------------------------------- update */
 
-  const state = {
+  const state: LocomotionState = {
     speed: 0,
     distance: 0,
     turnRate: 0,
@@ -486,14 +640,96 @@ export function buildCrowd(colliders: Colliders, beach: BeachResult): Crowd {
     justLanded: false,
   };
 
+  /** Local frame of an agent, for turning a world shot into a body-space one. */
+  const shotSide = (a: Agent, dirX: number, dirZ: number): { back: number; side: number } => {
+    // Forward is (sin yaw, cos yaw); right is the perpendicular.
+    const fx = Math.sin(a.yaw);
+    const fz = Math.cos(a.yaw);
+    return { back: dirX * fx + dirZ * fz, side: dirX * fz - dirZ * fx };
+  };
+
   return {
     group,
     cullable,
     posed,
+    people,
+    shoot(index, zone, dirX, dirZ, hitY) {
+      const a = agents[index];
+      if (!a || a.dead) return;
+
+      const { back, side } = shotSide(a, dirX, dirZ);
+      a.flinch = 1;
+      a.flinchSide = THREE.MathUtils.clamp(side, -1, 1);
+      a.flinchHead = zone === 'head';
+
+      // A head shot is always fatal, whatever they have absorbed so far.
+      if (zone === 'head') {
+        a.wounds = BODY_HITS_TO_KILL;
+      } else {
+        a.wounds++;
+        if (a.wounds < BODY_HITS_TO_KILL) {
+          // Survivors keep the wound, chosen from **where the round actually
+          // landed** rather than from which way it was travelling: the player
+          // watched it hit, and a low shot that produces a clutched shoulder
+          // reads as a bug. The body sphere spans roughly hip to collarbone, so
+          // the height within it maps straight onto hip, gut and shoulder.
+          if (a.injury === 'none') {
+            const local = hitY - a.pos.y;
+            const t = (local - a.target.bodyY) / a.target.bodyR;
+            a.injury = t < -0.35 ? 'leg' : t > 0.35 ? 'arm' : 'gut';
+            // Side comes from the shot: which hip or shoulder took it.
+            a.injurySide = side >= 0 ? 1 : -1;
+          }
+          // Wounded people do not stroll.
+          a.speed *= a.injury === 'leg' ? 0.55 : 0.75;
+          return;
+        }
+      }
+
+      a.dead = true;
+      a.target.dead = true;
+      a.dying = 0;
+      // Away from the shooter, so a round in the back drops them on their face.
+      a.deathBack = back >= 0 ? -1 : 1;
+      a.deathSide = side >= 0 ? 1 : -1;
+      a.speed = 0;
+      a.idle = true;
+    },
+    debug(index) {
+      const a = agents[index];
+      if (!a) return null;
+      return {
+        injury: a.injury,
+        injurySide: a.injurySide,
+        flinch: +a.flinch.toFixed(3),
+        flinchHead: a.flinchHead,
+        wounds: a.wounds,
+        dead: a.dead,
+        dying: +a.dying.toFixed(3),
+        idle: a.idle,
+        speed: +a.speed.toFixed(2),
+      };
+    },
     positions: () => [...agents.map((a) => a.pos), ...staticPositions],
     update(dt, playerPos) {
       for (const a of agents) {
         let moved = 0;
+
+        // A body on the pavement is scenery: it holds its final pose and stops
+        // costing an animator update entirely once it has finished falling.
+        if (a.dead) {
+          const far = a.pos.distanceToSquared(playerPos) > CULL_DIST * CULL_DIST;
+          a.cull.near = !far;
+          if (a.dying >= 1) continue;
+          a.dying = Math.min(1, a.dying + dt / DEATH_TIME);
+          a.pos.y = groundHeight(a.pos.x, a.pos.z);
+          a.rig.root.position.set(a.pos.x, a.pos.y, a.pos.z);
+          a.rig.root.rotation.y = a.yaw;
+          poseCollapse(a.rig, a.dying, a.deathBack, a.deathSide, a.pos.y);
+          continue;
+        }
+
+        a.flinch = Math.max(0, a.flinch - dt / FLINCH_TIME);
 
         if (!a.idle) {
           const step = a.speed * dt;
@@ -557,6 +793,11 @@ export function buildCrowd(colliders: Colliders, beach: BeachResult): Crowd {
         state.speed = a.idle ? 0 : a.speed;
         state.distance = moved;
         state.groundY = a.pos.y;
+        state.flinch = a.flinch;
+        state.flinchSide = a.flinchSide;
+        state.flinchHead = a.flinchHead;
+        state.injury = a.injury;
+        state.injurySide = a.injurySide;
         a.anim.update(dt, state);
       }
     },

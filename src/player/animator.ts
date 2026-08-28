@@ -84,6 +84,16 @@ export const AIM_POSE = {
   headY: 0.1,
 };
 
+/**
+ * Per-layer weights for the reaction poses, as a debugging seam.
+ *
+ * These layers stack on top of the gait and on each other, and at pedestrian
+ * distance an odd-looking arm could be coming from any of them. Multiplying a
+ * layer out at runtime — `window.SOLARA.reactions.injury = 0` — is the quickest
+ * way to find which one owns a pose. Left at 1 in normal play.
+ */
+export const REACTIONS = { flinch: 1, injury: 1, reload: 1 };
+
 export const GAIT = {
   walkSpeed: 1.65,
   runSpeed: 5.1,
@@ -121,6 +131,20 @@ export interface LocomotionState {
   aimPitch?: number;
   /** Support hand comes across for an SMG, stays clear for a pistol. */
   twoHanded?: boolean;
+  /** Reload progress, 0..1. Overrides the aim pose while it runs. */
+  reload?: number;
+
+  /* ------------------------------------------------- taking a round */
+
+  /** 1 the instant a round lands, decaying to 0. */
+  flinch?: number;
+  /** Lateral component of the shot in body space, -1..1. */
+  flinchSide?: number;
+  /** A head shot snaps rather than folds. */
+  flinchHead?: boolean;
+  /** A wound they are still carrying, which changes how they walk. */
+  injury?: 'none' | 'leg' | 'arm' | 'gut';
+  injurySide?: number;
 }
 
 interface Link {
@@ -145,6 +169,7 @@ export class MaraAnimator {
   private swim = 0;
   private stroke = 0;
   private aim = 0;
+  private reload = 0;
 
   /**
    * Fired the moment a foot plants. Only the player's animator sets this — the
@@ -304,6 +329,13 @@ export class MaraAnimator {
 
     r.chest.rotation.y = yawAmp * 0.5 * Math.cos(ph);
     r.chest.rotation.x = Math.sin(this.breath) * 0.016;
+    // Every channel the layers below write has to be written here too, even
+    // when the base pose has nothing to say about it. The reaction poses add
+    // into these, and a channel that is only ever added to accumulates: the
+    // flinch's `chest.rotation.z` reached a couple of radians over a single
+    // reaction and rolled the whole torso over, which read as the arms being
+    // wrong because the arms are what you notice.
+    r.chest.rotation.z = -bank * 0.25;
 
     /* ------------------------------------------------------------ head */
 
@@ -328,12 +360,31 @@ export class MaraAnimator {
     if (this.land > 0.001) this.poseLanding(this.land);
     if (this.swim > 0.001) this.poseSwim(this.swim, speed);
 
+    // A wound is carried into the walk itself, so it goes on before the aim
+    // layer and after the gait it is modifying.
+    if (st.injury && st.injury !== 'none' && REACTIONS.injury > 0) {
+      this.poseInjury(st.injury, st.injurySide ?? 1, g, ph);
+    }
+
     // Aiming last of the upper-body layers and before the foot IK: it has to
     // win over the arm swing, and it must not touch the legs, which keep
     // walking underneath it.
     this.aim += ((st.aim ?? 0) - this.aim) * Math.min(1, dt * 12);
     if (this.aim > 0.002) {
       this.poseAim(this.aim * (1 - this.swim) * (1 - this.air), st.aimPitch ?? 0, st.twoHanded ?? false);
+    }
+
+    // Reloading overrides the aim pose — both hands are busy with the magazine,
+    // so there is nothing left to hold the gun on target with.
+    this.reload = (st.reload ?? 0) * REACTIONS.reload;
+    if (this.reload > 0) this.poseReload(this.reload, st.twoHanded ?? false);
+
+    // The flinch is last and wins over everything: a round arriving interrupts
+    // whatever the body was doing, which is what makes it read as an impact
+    // rather than as a gesture.
+    const flinch = (st.flinch ?? 0) * REACTIONS.flinch;
+    if (flinch > 0.001) {
+      this.poseFlinch(flinch, st.flinchSide ?? 0, st.flinchHead ?? false);
     }
 
     /* -------------------------------------------- foot planting (IK) */
@@ -419,6 +470,183 @@ export class MaraAnimator {
     r.head.rotation.x = L(r.head.rotation.x, pitch * A.headXPitch + A.headX, w);
     r.head.rotation.y = L(r.head.rotation.y, A.headY, w);
     r.head.rotation.z = L(r.head.rotation.z, 0, w);
+  }
+
+  /**
+   * Taking a round.
+   *
+   * A short, violent impulse that decays — `w` arrives at 1 and is driven to 0
+   * by the caller. The shape is a whip: the part nearest the impact moves first
+   * and hardest, everything else follows and overshoots. Made symmetric it just
+   * looks like a bow.
+   *
+   * @param side Lateral component of the shot in body space, -1..1.
+   * @param head A head shot snaps the neck rather than folding the body, which
+   *   is the difference between a hit that hurts and a hit that kills.
+   */
+  private poseFlinch(w: number, side: number, head: boolean): void {
+    const r = this.rig;
+    // Sharp attack, slower release: `w` is linear, this is not.
+    const k = Math.sin(Math.min(1, w) * Math.PI * 0.85) * (0.35 + 0.65 * w);
+
+    if (head) {
+      // The head snaps back and the body follows a beat later — the arms drop
+      // out of the swing entirely, because nothing is driving them any more.
+      const L0 = THREE.MathUtils.lerp;
+      r.head.rotation.x -= 0.85 * k;
+      r.head.rotation.z += side * 0.6 * k;
+      r.head.rotation.y += side * 0.4 * k;
+      r.chest.rotation.x -= 0.22 * k;
+      r.spine.rotation.x -= 0.14 * k;
+      r.hips.position.y -= 0.05 * k;
+      for (const [arm, sgn] of [
+        [r.armL, 1],
+        [r.armR, -1],
+      ] as const) {
+        arm.shoulder.rotation.x = L0(arm.shoulder.rotation.x, 0.1, k);
+        arm.shoulder.rotation.z = L0(arm.shoulder.rotation.z, sgn * 0.22, k);
+        arm.elbow.rotation.x = L0(arm.elbow.rotation.x, -0.25, k);
+      }
+      return;
+    }
+
+    // A body shot folds them around it. Positive `rotation.x` on the spine and
+    // chest is *forward*: these joints carry their children along +Y, so they
+    // tip the opposite way to the hips and shoulders, which hang along -Y.
+    r.spine.rotation.x += 0.34 * k;
+    r.spine.rotation.z += side * 0.3 * k;
+    r.chest.rotation.x += 0.22 * k;
+    r.chest.rotation.z += side * 0.22 * k;
+    r.head.rotation.x += 0.3 * k;
+    r.hips.position.y -= 0.075 * k;
+    r.hips.rotation.z += side * 0.1 * k;
+
+    // The arms are *replaced*, not nudged. Adding a flinch to the walk's arm
+    // swing leaves whichever arm happened to be trailing pointing at the sky
+    // once the torso folds over it — the swing has to stop, which is what
+    // happens to a person who has just been shot.
+    // Hands to the wound: the upper arm stays hanging and the *elbow* does the
+    // work. Swinging the shoulder forward instead raises the whole arm — a
+    // negative `rotation.x` here carries the hand up as well as forward, and
+    // with the torso folded over it the elbows finish above the shoulders,
+    // which reads as reaching rather than as clutching.
+    const L = THREE.MathUtils.lerp;
+    for (const [arm, sgn] of [
+      [r.armL, 1],
+      [r.armR, -1],
+    ] as const) {
+      arm.shoulder.rotation.x = L(arm.shoulder.rotation.x, 0.06, k);
+      arm.shoulder.rotation.z = L(arm.shoulder.rotation.z, sgn * 0.26, k);
+      arm.shoulder.rotation.y = L(arm.shoulder.rotation.y, sgn * -0.3, k);
+      arm.elbow.rotation.x = L(arm.elbow.rotation.x, -1.5, k);
+    }
+  }
+
+  /**
+   * A wound they are still walking on.
+   *
+   * Permanent once set, and applied on top of the ordinary gait rather than
+   * replacing it, so an injured pedestrian still walks — badly. All three read
+   * at a distance, which is the only place these are ever seen from.
+   */
+  private poseInjury(
+    injury: 'leg' | 'arm' | 'gut',
+    side: number,
+    gait: number,
+    phase: number,
+  ): void {
+    const r = this.rig;
+    const s = side >= 0 ? 1 : -1;
+    const bad = s > 0 ? r.legL : r.legR;
+    const good = s > 0 ? r.legR : r.legL;
+    const badArm = s > 0 ? r.armL : r.armR;
+
+    if (injury === 'leg') {
+      // A limp is an asymmetry in time, not in pose: the bad leg takes a short
+      // stride and gets off the ground quickly, and the body dips onto it.
+      const onBad = Math.max(0, Math.cos(phase + (s > 0 ? 0 : PI)));
+      bad.hip.rotation.x *= 0.45;
+      bad.knee.rotation.x = bad.knee.rotation.x * 0.6 + 0.34 * gait;
+      bad.ankle.rotation.x += 0.2 * gait;
+      good.hip.rotation.x *= 1.15;
+      // The dip, and the lurch away from the bad side that comes with it.
+      r.hips.position.y -= onBad * 0.055 * gait;
+      r.hips.rotation.z += s * onBad * 0.14 * gait;
+      r.spine.rotation.z -= s * onBad * 0.1 * gait;
+      r.spine.rotation.x -= 0.06;
+      return;
+    }
+
+    if (injury === 'arm') {
+      // Cradled against the chest and kept still — the swing is the first thing
+      // to go when an arm hurts. The upper arm stays *hanging*: rotating the
+      // shoulder forward to bring the hand in lifts the whole arm with it, and
+      // the result reads as pointing rather than as nursing.
+      badArm.shoulder.rotation.x = 0.04;
+      badArm.shoulder.rotation.z = s * 0.22;
+      badArm.shoulder.rotation.y = -s * 0.55;
+      badArm.elbow.rotation.x = -1.95;
+      badArm.wrist.rotation.x = -0.2;
+      r.spine.rotation.z += s * 0.07;
+      r.chest.rotation.y += s * 0.12;
+      return;
+    }
+
+    // Gut: hunched around it, both forearms drawn across, head down. Same rule
+    // as above — the elbows do the work and the shoulders stay down.
+    r.spine.rotation.x += 0.3;
+    r.chest.rotation.x += 0.16;
+    r.head.rotation.x += 0.12;
+    r.hips.position.y -= 0.045;
+    for (const [arm, sgn] of [
+      [r.armL, 1],
+      [r.armR, -1],
+    ] as const) {
+      arm.shoulder.rotation.x = 0.05;
+      arm.shoulder.rotation.z = sgn * 0.2;
+      arm.shoulder.rotation.y = -sgn * 0.28;
+      arm.elbow.rotation.x = -1.55;
+    }
+  }
+
+  /**
+   * Reloading.
+   *
+   * Three beats, matched to the three clacks `audio/weapons.ts` schedules
+   * across the same duration — magazine out, magazine in, slide released. The
+   * sound is doing half the work here, so the poses have to land on it: the
+   * support hand is at the magazine well when the first clack plays and back on
+   * the gun by the third.
+   */
+  private poseReload(t: number, twoHanded: boolean): void {
+    const r = this.rig;
+    const L = THREE.MathUtils.lerp;
+    // Ease the whole layer in and out so it does not snap out of the aim pose.
+    const w = Math.min(1, Math.min(t, 1 - t) * 6);
+
+    // The gun comes down and rolls inward to where the hands can work on it.
+    r.armR.shoulder.rotation.x = L(r.armR.shoulder.rotation.x, -0.72, w);
+    r.armR.shoulder.rotation.y = L(r.armR.shoulder.rotation.y, 0.42, w);
+    r.armR.shoulder.rotation.z = L(r.armR.shoulder.rotation.z, -0.1, w);
+    r.armR.elbow.rotation.x = L(r.armR.elbow.rotation.x, -1.35, w);
+    r.armR.wrist.rotation.z = L(r.armR.wrist.rotation.z, -0.5, w);
+
+    // The support hand does the work: down to the magazine, back up, then a
+    // short sharp pull for the slide.
+    const drop = t < 0.42 ? t / 0.42 : t < 0.72 ? 1 - (t - 0.42) / 0.3 : 0;
+    const slide = t > 0.72 ? Math.sin(((t - 0.72) / 0.28) * PI) : 0;
+
+    r.armL.shoulder.rotation.x = L(r.armL.shoulder.rotation.x, -0.5 - 0.35 * drop + 0.2 * slide, w);
+    r.armL.shoulder.rotation.y = L(r.armL.shoulder.rotation.y, -0.55 - 0.2 * slide, w);
+    r.armL.shoulder.rotation.z = L(r.armL.shoulder.rotation.z, 0.12 + 0.3 * drop, w);
+    r.armL.elbow.rotation.x = L(r.armL.elbow.rotation.x, -1.5 - 0.5 * drop - 0.35 * slide, w);
+    r.armL.wrist.rotation.x = L(r.armL.wrist.rotation.x, -0.3 * drop, w);
+
+    // She looks at what her hands are doing, and squares back up at the end.
+    r.head.rotation.x = L(r.head.rotation.x, 0.34 * (1 - slide), w);
+    r.head.rotation.y = L(r.head.rotation.y, 0.24, w);
+    r.chest.rotation.y = L(r.chest.rotation.y, -0.1, w);
+    if (!twoHanded) r.spine.rotation.y = L(r.spine.rotation.y, -0.06, w);
   }
 
   private poseAir(vy: number, w: number): void {

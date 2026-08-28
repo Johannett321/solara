@@ -5,7 +5,7 @@ import { buildWeather } from './render/weather';
 import { buildPost } from './render/post';
 import { buildWorld } from './world';
 import { buildMara } from './player/rig';
-import { MaraAnimator, GAIT, AIM_POSE } from './player/animator';
+import { MaraAnimator, GAIT, AIM_POSE, REACTIONS } from './player/animator';
 import { Controller } from './player/controller';
 import { VehicleController } from './player/driving';
 import { BoatController } from './player/boating';
@@ -91,6 +91,8 @@ const arsenal = new Arsenal(rig, world.colliders, {
   onHit: (kind, point) => {
     if (kind !== 'sky') audio.bulletImpact(kind, point);
   },
+  onPersonHit: (index, zone, dir, point) =>
+    world.shootPerson(index, zone, dir.x, dir.z, point.y),
   onDryFire: () => audio.dryFire(),
   onReload: (spec) => audio.reload(spec.reloadTime),
 });
@@ -445,6 +447,7 @@ renderer.domElement.addEventListener('click', () => {
   arsenal,
   wheel,
   aimPose: AIM_POSE,
+  reactions: REACTIONS,
   // Under automation pointer lock is never really held, so `Input` ignores
   // every mouse event. Driving the weapons from a script means forcing this.
   input,
@@ -589,6 +592,7 @@ function frame(): void {
         aim: spec ? 0.34 + chase.aim01 * 0.66 : 0,
         aimPitch: chase.pitch,
         twoHanded: spec ? spec.twoHanded : false,
+        reload: arsenal.reloadProgress,
       });
 
       chase.update(dt, controller.position, controller.speed, GAIT.runSpeed);
@@ -605,7 +609,7 @@ function frame(): void {
           eye: camera.position,
           look: aimDir,
           speed: controller.speed,
-          targets: { people: world.crowdPositions(), vehicles: world.targets },
+          targets: { people: world.people, vehicles: world.targets },
         });
       } else {
         // Still tick the effects: tracers and puffs have to finish fading even

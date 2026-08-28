@@ -3,7 +3,7 @@ import { Colliders } from '../world/collision';
 import { MaraRig } from '../player/rig';
 import { buildWeapon, MUZZLE } from './models';
 import { WEAPONS, WeaponId, WeaponSpec } from './specs';
-import { Hit, HitKind, Targets, spreadDir, traceShot } from './ballistics';
+import { Hit, HitKind, HitZone, Targets, spreadDir, traceShot } from './ballistics';
 import { WeaponFx } from './fx';
 
 /**
@@ -59,6 +59,11 @@ export interface ArsenalHooks {
   onRecoil(pitch: number, yaw: number): void;
   onShot(spec: WeaponSpec, muzzle: THREE.Vector3): void;
   onHit(kind: HitKind, point: THREE.Vector3): void;
+  /**
+   * A round landed on person `index`. `dir` is the shot direction, so the
+   * crowd can work out which way they fold.
+   */
+  onPersonHit(index: number, zone: HitZone, dir: THREE.Vector3, point: THREE.Vector3): void;
   onDryFire(): void;
   onReload(spec: WeaponSpec): void;
 }
@@ -84,6 +89,8 @@ export class Arsenal {
     point: new THREE.Vector3(),
     distance: 0,
     normal: new THREE.Vector3(),
+    person: -1,
+    zone: null,
   };
   private dir = new THREE.Vector3();
   private muzzleWorld = new THREE.Vector3();
@@ -143,6 +150,13 @@ export class Arsenal {
 
   get isReloading(): boolean {
     return this.reloading > 0;
+  }
+
+  /** 0..1 through the reload, for the animator. 0 when not reloading. */
+  get reloadProgress(): number {
+    const spec = this.spec;
+    if (!spec || this.reloading <= 0) return 0;
+    return THREE.MathUtils.clamp(1 - this.reloading / spec.reloadTime, 0, 1);
   }
 
   /** True while a weapon is drawn — the camera and the animator both ask. */
@@ -252,6 +266,9 @@ export class Arsenal {
     this.fx.shot(this.muzzleWorld, this.hit.point, this.hit.kind, spec.twoHanded ? 1 : 0.8);
     this.hooks.onShot(spec, this.muzzleWorld);
     if (this.hit.kind !== 'sky') this.hooks.onHit(this.hit.kind, this.hit.point);
+    if (this.hit.person >= 0 && this.hit.zone) {
+      this.hooks.onPersonHit(this.hit.person, this.hit.zone, this.dir, this.hit.point);
+    }
 
     // Kick up and slightly to one side, so a held burst walks off target.
     this.hooks.onRecoil(spec.recoil, (Math.random() - 0.5) * spec.recoil * 0.9);

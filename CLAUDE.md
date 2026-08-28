@@ -537,6 +537,79 @@ Three things that were wrong first time:
 - Muzzle flashes are deliberately authored *above* the bloom threshold, unlike
   the neon in `world/facades.ts` which sits below it. A muzzle flash is the one
   thing in the world that is meant to smear.
+- **Tracer geometry runs along +Z, not -Z.** `Object3D.lookAt` is not the
+  camera's: `Matrix4.lookAt(eye, target, up)` puts +Z on target→eye, and
+  `Object3D.lookAt` passes those arguments *reversed* for anything that is not a
+  camera or a light. A plain mesh therefore points its **+Z** at the target
+  where a camera points its -Z. Built along -Z, every tracer drew from the
+  muzzle backwards past the player.
+- The reload pose has three beats and `audio/weapons.ts` schedules three clacks
+  across the same duration. They have to stay matched — the sound is doing half
+  the work, and the support hand has to be at the magazine when the first clack
+  lands.
+
+#### Shooting people
+
+Pedestrians carry two hit spheres — head and body — sized per agent, because the
+crowd varies height by ±10% and one fixed head sphere sits in the neck of the
+tall ones and above the hair of the short ones. The head is tested *first*: it
+is inside the body sphere's vertical span, so testing the body first swallows
+every head shot.
+
+A head shot kills outright. The body takes three. A survivor keeps a permanent
+`Injury` — leg, arm or gut — chosen from **where the round landed**, not from
+which way it was travelling: the player watched it hit, and a low shot that
+produces a clutched shoulder reads as a bug. The wound then changes how they
+walk for the rest of the session; `crowd.debug(i)` / `world.personDebug(i)` is
+on `window.SOLARA` because at pedestrian distance a raised arm could be a
+flinch, a nursed wound or the ordinary walk swing, and guessing is hopeless.
+
+Death is a scripted collapse, not a ragdoll — there is no physics to hang one
+on, and at these distances the collapse is more legible anyway. Two things it
+gets wrong if you are not careful:
+
+- **Do not pull the pelvis down `hips.position.y` to sink the body.** That axis
+  is the body's own up, and a quarter turn later it points along the ground, so
+  'down' telescopes the character into itself. The root rotation does the work
+  and the root only rises by half a body's thickness.
+- The knees buckle as a *transient* that decays. Held bent they end up pointing
+  at the sky and the body reads as a chair.
+
+#### Animation layers stack, so every channel must be reset
+
+`poseFlinch`, `poseInjury`, `poseReload` and `poseAim` all run on top of the
+gait and on each other. **A layer that does `+=` on a channel the base pose
+never writes will accumulate.** `poseFlinch` added into `chest.rotation.z`,
+which the base pose set no value for; over one reaction it reached a couple of
+radians and rolled the whole torso over. It presented as the arms flying out —
+the arms are what you notice — and survived three wrong fixes aimed at the arms
+before the base pose was the thing at fault. The base pose now writes
+`chest.rotation.z` explicitly for that reason.
+
+Two more that cost time here:
+
+- **A negative `shoulder.rotation.x` carries the hand up as well as forward.**
+  Swinging the shoulder to bring a hand to a wound lifts the whole arm, and with
+  the torso folded over it the elbows finish above the shoulders. Hands come in
+  by bending the *elbow* while the upper arm stays hanging.
+- **Positive `rotation.x` is forward on the spine and chest and backward on the
+  hips and shoulders.** The torso joints carry their children along +Y and the
+  limbs hang along -Y, so they tip opposite ways. Measure it rather than
+  reasoning about it — set a joint, read the child's world position.
+
+`REACTIONS` in `player/animator.ts` multiplies each layer out at runtime
+(`window.SOLARA.reactions.injury = 0`) and is the fastest way to find which
+layer owns a pose.
+
+#### Measuring a skinned crowd member
+
+**`Box3.setFromObject` on a SkinnedMesh reads the bind-pose box**, transformed by
+the object matrix — it says nothing about the animated pose. A collapse measured
+this way looks like it is sinking a quarter of a metre through the pavement when
+it is resting on it correctly. Read the skeleton's bone world positions instead;
+bone order is the array passed to `skinRig`: hips, spine, chest, neck, head,
+five ponytail links, then legL, legR, armL, armR as hip/knee/ankle and
+shoulder/elbow/wrist.
 
 #### Ready for the gun shops
 

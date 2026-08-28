@@ -15,17 +15,41 @@ import { groundHeight } from '../world/layout';
 
 export type HitKind = 'ground' | 'wall' | 'person' | 'vehicle' | 'sky';
 
+/** Where on a person a round landed. A head shot is not a body shot. */
+export type HitZone = 'head' | 'body';
+
 export interface Hit {
   kind: HitKind;
   point: THREE.Vector3;
   distance: number;
   /** Rough surface normal, for orienting the impact puff. */
   normal: THREE.Vector3;
+  /** Index into `Targets.people` when `kind` is 'person', else -1. */
+  person: number;
+  /** Set with `person`; null otherwise. */
+  zone: HitZone | null;
+}
+
+/**
+ * A pedestrian, as two spheres.
+ *
+ * Heights are stored per person rather than assumed, because the crowd varies
+ * height by ±10% and a fixed head sphere would sit in the neck of the tall ones
+ * and above the hair of the short ones.
+ */
+export interface PersonTarget {
+  /** Feet position, held by reference and written by the crowd each frame. */
+  position: THREE.Vector3;
+  headY: number;
+  headR: number;
+  bodyY: number;
+  bodyR: number;
+  /** Bodies on the ground stop being targets. */
+  dead: boolean;
 }
 
 export interface Targets {
-  /** Live pedestrian positions, feet on the ground. */
-  people: THREE.Vector3[];
+  people: PersonTarget[];
   /** Vehicles, as centre plus an enclosing radius. */
   vehicles: Array<{ position: THREE.Vector3; radius: number }>;
 }
@@ -90,15 +114,28 @@ export function traceShot(
   let best = range;
   let bestKind: HitKind = 'sky';
   let bestCentre: THREE.Vector3 | null = null;
+  let bestPerson = -1;
+  let bestZone: HitZone | null = null;
 
-  for (const p of targets.people) {
-    // Torso-height sphere: a standing figure is not a ball on the pavement.
-    centre.set(p.x, p.y + 0.95, p.z);
-    const t = sphereHit(origin, dir, centre, 0.42, best);
+  for (let i = 0; i < targets.people.length; i++) {
+    const p = targets.people[i];
+    if (p.dead) continue;
+    // Head first: it is inside the body sphere's vertical span, so testing the
+    // body alone would swallow every head shot.
+    centre.set(p.position.x, p.position.y + p.headY, p.position.z);
+    let t = sphereHit(origin, dir, centre, p.headR, best);
+    let zone: HitZone | null = t >= 0 ? 'head' : null;
+    if (t < 0) {
+      centre.set(p.position.x, p.position.y + p.bodyY, p.position.z);
+      t = sphereHit(origin, dir, centre, p.bodyR, best);
+      if (t >= 0) zone = 'body';
+    }
     if (t >= 0) {
       best = t;
       bestKind = 'person';
       bestCentre = centre.clone();
+      bestPerson = i;
+      bestZone = zone;
     }
   }
   for (const v of targets.vehicles) {
@@ -108,6 +145,8 @@ export function traceShot(
       best = t;
       bestKind = 'vehicle';
       bestCentre = centre.clone();
+      bestPerson = -1;
+      bestZone = null;
     }
   }
 
@@ -130,6 +169,8 @@ export function traceShot(
         else lo = mid;
       }
       out.kind = 'ground';
+      out.person = -1;
+      out.zone = null;
       out.distance = hi;
       out.point.copy(origin).addScaledVector(dir, hi);
       out.point.y = groundHeight(out.point.x, out.point.z);
@@ -139,6 +180,8 @@ export function traceShot(
 
     if (travelled < COLLIDER_RANGE && colliders.hits(probe.x, probe.z, probe.y)) {
       out.kind = 'wall';
+      out.person = -1;
+      out.zone = null;
       out.distance = travelled;
       out.point.copy(origin).addScaledVector(dir, travelled);
       // Face the shooter. A real normal would need the collider's face, and at
@@ -149,6 +192,8 @@ export function traceShot(
   }
 
   out.kind = bestKind;
+  out.person = bestPerson;
+  out.zone = bestZone;
   out.distance = best;
   out.point.copy(origin).addScaledVector(dir, best);
   if (bestCentre) out.normal.copy(out.point).sub(bestCentre).normalize();
