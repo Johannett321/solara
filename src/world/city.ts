@@ -676,8 +676,8 @@ function vacantLot(
         const z = s * (d / 2 - 2.8);
         car.group.position.set(x, 0.02, z);
         // Nosed into the bay. Bays run along Z, and the model's nose is local
-        // +X, so a heading of 0 (facing +Z) means rotating by -PI/2.
-        car.group.rotation.y = s > 0 ? -Math.PI / 2 : Math.PI / 2;
+        // **-X**, so a heading of 0 (facing +Z) means rotating by +PI/2.
+        car.group.rotation.y = s > 0 ? Math.PI / 2 : -Math.PI / 2;
         g.add(car.group);
         const spec = carSpec(kind);
         colliders.addBoxAt(cx + x, cz + z, spec.width, spec.length, spec.roofY);

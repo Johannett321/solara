@@ -191,7 +191,7 @@ export class VehicleController {
     car.build.group.position.copy(this.position);
     // `yaw` is a heading in Mara's convention (forward = sin,cos), but the car
     // model's nose runs along its local +X, so the mesh trails by a quarter turn.
-    car.build.group.rotation.y = this.yaw - Math.PI / 2;
+    car.build.group.rotation.y = this.yaw + Math.PI / 2;
 
     this.spin -= (this.speed / car.build.spec.wheelR) * dt;
     const wheels = car.build.wheels;

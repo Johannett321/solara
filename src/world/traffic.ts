@@ -1,8 +1,11 @@
 import * as THREE from 'three';
 import { Rng } from '../core/rng';
-import { buildCar, bakeVehicle, CarKind } from './cars';
+import { buildCar, bakeVehicle, CarKind, Drivable } from './cars';
+import { Colliders, ColliderHandle } from './collision';
 import { EXPRESSWAY_X, EXPRESSWAY_Y } from './city';
+import { carSpec } from './cars';
 import type { Cullable } from './culling';
+import type { Panic } from './panic';
 import {
   STRIP_MIN_Z,
   STRIP_MAX_Z,
@@ -32,17 +35,35 @@ interface Vehicle {
   zMax: number;
   speed: number;
   cruise: number;
+  /** 0 calm, 1 flooring it. */
+  panic: number;
+  /** Phase offset so a panicking lane does not weave in unison. */
+  wobble: number;
   wheels: THREE.Object3D[];
   wheelR: number;
   /** This car's entry in the culler; `near` is the range rule below. */
   cull: Cullable;
+  /**
+   * The player has taken this one. The AI stops driving it for good — an
+   * abandoned car does not rejoin the flow of traffic — and it keeps its own
+   * place in the culler.
+   */
+  taken: boolean;
+  /** Still carrying its AI driver, who gets hauled out on the first carjack. */
+  hasDriver: boolean;
 }
 
 export interface Traffic {
   group: THREE.Group;
   /** One entry per car, for group-level culling. */
   cullable: Cullable[];
-  update(dt: number, playerPos: THREE.Vector3): void;
+  /**
+   * Every car on the road is enterable. These go into the same
+   * `world.drivables` list the kerbside cars use, so `main.ts` does not have to
+   * know the difference — the only thing that marks them out is `hasDriver`.
+   */
+  drivables: Drivable[];
+  update(dt: number, playerPos: THREE.Vector3, panic: Panic): void;
 }
 
 /**
@@ -103,12 +124,41 @@ const LENGTH = 5.0;
 /** Bumper-to-bumper gap a driver will tolerate before lifting off. */
 const HEADWAY = 9.5;
 
-export function buildTraffic(): Traffic {
+export function buildTraffic(colliders: Colliders): Traffic {
   const group = new THREE.Group();
   group.name = 'traffic';
   const rng = new Rng(90210);
   const vehicles: Vehicle[] = [];
   const cullable: Cullable[] = [];
+  const drivables: Drivable[] = [];
+
+  /**
+   * A collider that does not exist until the car is abandoned.
+   *
+   * Traffic drives *through* the player rather than colliding, so a moving car
+   * needs no footprint — and 621 permanent boxes would be paid for on every
+   * `resolve` and on every step of the camera arm's `raycastXZ`, which walks at
+   * 25 cm and is O(colliders). Only the handful the player actually parks ever
+   * become real.
+   */
+  const lazyCollider = (kind: CarKind, x: number, z: number, yaw: number): ColliderHandle => {
+    let real: ColliderHandle | null = null;
+    const spec = carSpec(kind);
+    const make = (cx: number, cz: number, cy: number): ColliderHandle => {
+      real ??= colliders.addSwitchableBox(cx, cz, spec.length, spec.width, cy, spec.roofY);
+      return real;
+    };
+    return {
+      enable: () => make(x, z, yaw).enable(),
+      disable: () => real?.disable(),
+      move: (cx, cz, cy) => {
+        x = cx;
+        z = cz;
+        yaw = cy;
+        make(cx, cz, cy).move(cx, cz, cy);
+      },
+    };
+  };
 
   let i = 0;
   for (const lane of buildLanes()) {
@@ -122,9 +172,9 @@ export function buildTraffic(): Traffic {
       const build = bakeVehicle(buildCar(kind, color, rng));
 
       // Heading convention: forward = (sin yaw, cos yaw). The model's nose runs
-      // along its local +X, so the mesh trails the heading by a quarter turn.
+      // along its local **-X**, so the mesh leads the heading by a quarter turn.
       const heading = dir > 0 ? 0 : Math.PI;
-      build.group.rotation.y = heading - Math.PI / 2;
+      build.group.rotation.y = heading + Math.PI / 2;
       build.group.position.set(laneX, 0, z);
       group.add(build.group);
 
@@ -136,9 +186,11 @@ export function buildTraffic(): Traffic {
       };
       cullable.push(cull);
 
-      vehicles.push({
+      const v: Vehicle = {
         group: build.group,
         cull,
+        taken: false,
+        hasDriver: true,
         lane: laneX,
         deckY: lane.y,
         dir,
@@ -147,8 +199,27 @@ export function buildTraffic(): Traffic {
         zMax: lane.zMax,
         speed: 0,
         cruise: rng.range(7.5, 12.5),
+        panic: 0,
+        wobble: rng.range(0, Math.PI * 2),
         wheels: build.wheels,
         wheelR: build.spec.wheelR,
+      };
+      vehicles.push(v);
+
+      // Live references: `position` is the group's own vector, so the entry
+      // tracks the car down the road without anything having to copy it.
+      drivables.push({
+        build,
+        collider: lazyCollider(kind, laneX, z, heading),
+        position: build.group.position,
+        yaw: heading,
+        occupied: false,
+        hasDriver: true,
+        onTaken: () => {
+          v.taken = true;
+          v.speed = 0;
+          v.cull.near = true;
+        },
       });
     }
   }
@@ -158,8 +229,12 @@ export function buildTraffic(): Traffic {
   return {
     group,
     cullable,
-    update(dt, playerPos) {
+    drivables,
+    update(dt, playerPos, panic) {
       for (const v of vehicles) {
+        // Taken cars belong to the player now; the driving model owns their
+        // transform and the culler owns their visibility.
+        if (v.taken) continue;
         /* ------------------------------------------------ car following */
 
         const span = v.zMax - v.zMin;
@@ -180,9 +255,21 @@ export function buildTraffic(): Traffic {
           gap = Math.min(gap, d - LENGTH * 0.5);
         }
 
-        const target = gap < HEADWAY ? v.cruise * Math.max(0, gap / HEADWAY) : v.cruise;
-        // Brake harder than you accelerate.
-        const rate = target < v.speed ? 9 : 3.2;
+        /* ---------------------------------------------------------- panic */
+
+        // Drivers who have seen a gun stop driving like drivers: they floor it,
+        // they tailgate, and they wander out of lane. Eased in, and eased out
+        // over several seconds so the street settles rather than snapping back.
+        const fear = panic.at(v.lane, v.z);
+        v.panic += (fear - v.panic) * Math.min(1, dt * (fear > v.panic ? 2.5 : 0.6));
+
+        const cruise = v.cruise * (1 + v.panic * 1.15);
+        // Headway compliance goes with the panic — but never to zero, or the
+        // lane telescopes into one pile of cars at the first red light.
+        const headway = HEADWAY * (1 - v.panic * 0.45);
+        const target = gap < headway ? cruise * Math.max(0, gap / headway) : cruise;
+        // Brake harder than you accelerate, and harder still when frightened.
+        const rate = target < v.speed ? 9 : 3.2 + v.panic * 5;
         v.speed += THREE.MathUtils.clamp(target - v.speed, -rate * dt, rate * dt);
 
         /* ------------------------------------------------------- motion */
@@ -192,7 +279,14 @@ export function buildTraffic(): Traffic {
         if (v.z < v.zMin) v.z += span;
         // Follow the surface, so traffic climbs the bridges instead of
         // driving straight through the riverbed.
-        v.group.position.set(v.lane, v.deckY ?? groundHeight(v.lane, v.z), v.z);
+        // Swerve. The wander is driven off `z` rather than a clock so a car
+        // weaves along the road instead of shimmying on the spot in traffic.
+        const swerve = v.panic * Math.sin(v.z * 0.22 + v.wobble) * 1.35;
+        const x = v.lane + swerve;
+        v.group.position.set(x, v.deckY ?? groundHeight(x, v.z), v.z);
+        // Point where it is actually going, so a swerving car leans into it.
+        const drift = v.panic * Math.cos(v.z * 0.22 + v.wobble) * 0.3;
+        v.group.rotation.y = (v.dir > 0 ? 0 : Math.PI) + Math.PI / 2 - drift * v.dir;
 
         // Roll the wheels to match ground speed.
         const spin = (v.speed / v.wheelR) * dt * v.dir;

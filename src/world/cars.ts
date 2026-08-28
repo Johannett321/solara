@@ -455,6 +455,9 @@ export function buildCar(kind: CarKind, color: number, rng: Rng): CarBuild {
 
   /* --------------------------------------------------------------- trim */
 
+  // The profile runs nose-first, and every `profile[0][0]` is *negative*: the
+  // car's nose is at local **-X**. This is the one fact the whole heading
+  // convention rests on — see `rotation.y = yaw + PI/2` at every placement.
   const front = s.profile[0][0];
   const rear = s.profile[s.profile.length - 1][0];
 
@@ -648,6 +651,13 @@ const PALETTE: Array<[CarKind, number]> = [
 
 /** A parked car the player can walk up to and get into. */
 export interface Drivable {
+  /**
+   * Someone is already at the wheel. Set on moving traffic; `main.ts` hauls
+   * them out on entry and clears it.
+   */
+  hasDriver?: boolean;
+  /** Called once when the player takes the car, so its owner can let go. */
+  onTaken?: () => void;
   build: CarBuild;
   /** Its footprint in the collision world, switched off while being driven. */
   collider: ColliderHandle;
@@ -688,14 +698,17 @@ const CITY_PALETTE: Array<[CarKind, number]> = [
 /**
  * One car in every `DRIVABLE_EVERY` along the kerb can actually be driven.
  *
- * There are several kilometres of kerb in this city. A drivable car has to stay
- * out of the static bake — a wheel merged into the street cannot steer — so it
- * costs around twenty draw calls of its own, where a scenery car costs
- * effectively nothing once merged. Making every one of them drivable is a few
- * thousand extra draw calls; this ratio keeps one within a few parking bays
- * anywhere in the city at a fraction of the cost.
+ * Set to 1: every car in the city is enterable. A drivable car has to stay out
+ * of the static bake — a wheel merged into the street cannot steer — so it is
+ * eleven draw calls of its own where a scenery car costs effectively nothing
+ * once merged, and there are several kilometres of kerb here.
+ *
+ * That trade is affordable now for two reasons it was not before: a parked car
+ * is 11 meshes rather than 28 since its wheels bake into the body, and parked
+ * cars carry a 230 m draw range (`world/index.ts`). Raise this number again if
+ * the city ever gets denser — it is the cheapest single knob on the frame.
  */
-const DRIVABLE_EVERY = 3;
+const DRIVABLE_EVERY = 1;
 
 /** A block face gets a full row of parked cars, or none at all. */
 const RUN_CHANCE = 0.26;
@@ -711,8 +724,8 @@ export function buildCars(colliders: Colliders): CarsResult {
   const park = (kind: CarKind, color: number, x: number, z: number, yaw: number) => {
     const build = bakeVehicle(buildCar(kind, color, rng), true);
     build.group.position.set(x, 0, z);
-    // `yaw` is a heading (forward = sin,cos); the model's nose is local +X.
-    build.group.rotation.y = yaw - Math.PI / 2;
+    // `yaw` is a heading (forward = sin,cos); the model's nose is local -X.
+    build.group.rotation.y = yaw + Math.PI / 2;
     g.add(build.group);
 
     const s = SPECS[kind];
@@ -765,8 +778,8 @@ export function buildCars(colliders: Colliders): CarsResult {
 
     const build = buildCar(kind, colour, rng);
     build.group.position.set(x, 0, z);
-    // `yaw` is a heading (forward = sin,cos); the model's nose is local +X.
-    build.group.rotation.y = yaw - Math.PI / 2;
+    // `yaw` is a heading (forward = sin,cos); the model's nose is local -X.
+    build.group.rotation.y = yaw + Math.PI / 2;
     staticGroup.add(build.group);
 
     const s = SPECS[kind];

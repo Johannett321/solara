@@ -96,36 +96,73 @@ export class WeaponAudio {
     setTimeout(() => p.disconnect(), 900);
   }
 
+  /** A filtered noise transient: the click of a catch or a latch. */
+  private clack(when: number, freq: number, q: number, level: number, decay: number): void {
+    const c = this.core;
+    const n = c.noise('white');
+    const bp = c.filter('bandpass', freq, q);
+    n.connect(bp);
+    this.burst(n, bp, c.bus.sfx, level, 0.001, decay, when);
+  }
+
+  /** The weight behind a click: a fast pitch drop, which is what reads as metal
+   * moving rather than a fingernail on a desk. */
+  private thunk(when: number, from: number, to: number, level: number, decay: number): void {
+    const c = this.core;
+    const o = c.osc('triangle', from);
+    o.frequency.exponentialRampToValueAtTime(to, when + decay * 0.8);
+    c.envelope(o, c.bus.sfx, level, 0.002, decay, when);
+  }
+
   /** Hammer falling on an empty chamber. */
   dryFire(): void {
     const c = this.core;
     if (!c.running) return;
-    const click = c.noise('white');
-    const bp = c.filter('bandpass', 2600, 3);
-    click.connect(bp);
-    this.burst(click, bp, c.bus.sfx, 0.16, 0.001, 0.02, c.now);
+    const now = c.now;
+    this.clack(now, 2400, 2.5, 0.34, 0.03);
+    this.thunk(now, 320, 150, 0.2, 0.05);
   }
 
   /**
-   * Magazine out, magazine in, slide released.
+   * Magazine out, magazine in, bolt released.
    *
    * Scheduled across the reload rather than fired as one sound: the rhythm of
-   * three separate clacks is what tells the player how long the reload takes,
-   * without a progress bar.
+   * three separate mechanical events is what tells the player how long the
+   * reload takes, without a progress bar. `player/animator.ts` poses the hands
+   * to land on the same three beats.
+   *
+   * The first pass was three thin bandpassed clicks at level 0.14–0.2, which
+   * measured 0.023 RMS on the master bus against a 0.020 ambience floor — they
+   * were playing and were inaudible. Every beat now carries a pitched body
+   * under the transient, which is what makes it read as metal.
    */
   reload(duration: number): void {
     const c = this.core;
     if (!c.running) return;
     const now = c.now;
-    const clack = (when: number, freq: number, level: number) => {
-      const n = c.noise('white');
-      const bp = c.filter('bandpass', freq, 5);
-      n.connect(bp);
-      this.burst(n, bp, c.bus.sfx, level, 0.001, 0.035, when);
-    };
-    clack(now + 0.02, 1500, 0.14);
-    clack(now + duration * 0.55, 900, 0.18);
-    clack(now + duration * 0.92, 2100, 0.2);
+
+    // Levels measured on an analyser tap on the master bus, the same way the
+    // rest of `audio/` was set: ambience sits at ~0.021 RMS and a gunshot at
+    // ~0.16. A reload wants to land near 0.08 — plainly audible over the
+    // street, and obviously not a gunshot.
+
+    // 1. Magazine catch, and the magazine dropping clear.
+    this.clack(now + 0.02, 1800, 3, 0.28, 0.035);
+    this.thunk(now + 0.02, 420, 190, 0.15, 0.06);
+    this.clack(now + 0.1, 700, 1.6, 0.15, 0.09);
+
+    // 2. Fresh magazine seated — the heaviest of the three, and the one the
+    // player feels. Low and solid rather than bright.
+    const seat = now + duration * 0.55;
+    this.clack(seat, 520, 1.4, 0.25, 0.06);
+    this.thunk(seat, 260, 95, 0.32, 0.1);
+
+    // 3. Bolt released: bright, short, with a little ring off the receiver.
+    const bolt = now + duration * 0.9;
+    this.clack(bolt, 2600, 2.2, 0.3, 0.03);
+    this.thunk(bolt, 700, 300, 0.17, 0.05);
+    const ring = c.osc('triangle', 1750);
+    c.envelope(ring, c.bus.sfx, 0.055, 0.002, 0.13, bolt);
   }
 
   /** Bullet arriving: dust, metal or meat. */

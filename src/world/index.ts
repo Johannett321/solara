@@ -17,6 +17,7 @@ import { buildHarbour, HarbourResult } from './harbour';
 import { buildOcean, Ocean } from '../render/water';
 import { bakeChunked } from '../util/bake';
 import { Culler, freezeMatrices } from './culling';
+import { Panic } from './panic';
 import { WORLD_MAX_X, WORLD_MIN_Z, WORLD_MAX_Z, OCEAN_EDGE } from './layout';
 import type { HitZone, PersonTarget } from '../weapons/ballistics';
 
@@ -37,6 +38,13 @@ export interface World {
   shootPerson(index: number, zone: HitZone, dirX: number, dirZ: number, hitY: number): void;
   /** Agent state for `window.SOLARA` — see `Crowd.debug`. */
   personDebug(index: number): Record<string, unknown> | null;
+  /** Drop a fleeing pedestrian on the street — the driver of a stolen car. */
+  ejectDriver(x: number, z: number, yaw: number): void;
+  /**
+   * The street's reaction to a drawn weapon. Call `alarm` every frame the
+   * player is aiming; everything else reads it.
+   */
+  panic: Panic;
   /**
    * Everything a bullet can hit that is not the ground or a collider: parked
    * cars, moving traffic and moored boats.
@@ -106,6 +114,7 @@ export function buildWorld(): World {
   const group = new THREE.Group();
   const colliders = new Colliders();
   const culler = new Culler();
+  const panic = new Panic();
 
   // Groups of baked chunks. Collected as they are built and then, once the
   // whole world has been placed, frozen: their matrices never change again, and
@@ -165,11 +174,13 @@ export function buildWorld(): World {
   group.add(chunks(bakeChunked(props.group, chunkByZ)));
   group.add(props.fronds.mesh);
 
-  const crowd: Crowd = buildCrowd(colliders, beach);
+  // Runtime-spawned pedestrians — the driver hauled out of a car — have to be
+  // handed to the culler, which is built below them.
+  const crowd: Crowd = buildCrowd(colliders, beach, (c) => culler.track(c));
   group.add(crowd.group);
   chunks(crowd.posed, RANGE.posedCrowd);
 
-  const traffic: Traffic = buildTraffic();
+  const traffic: Traffic = buildTraffic(colliders);
   group.add(traffic.group);
 
   // Boats float, so they stay out of the static bake.
@@ -207,14 +218,18 @@ export function buildWorld(): World {
   return {
     group,
     colliders,
-    drivables: cars.drivables,
+    // Kerbside and moving traffic in one list: `main.ts` finds the nearest car
+    // without caring which it is.
+    drivables: [...cars.drivables, ...traffic.drivables],
     boats: boats.boats,
     targets,
     footprints: [...buildings.footprints, ...city.footprints],
     crowdPositions: () => crowd.positions(),
     people: crowd.people,
+    panic,
     shootPerson: (i, zone, dirX, dirZ, hitY) => crowd.shoot(i, zone, dirX, dirZ, hitY),
     personDebug: (i) => crowd.debug(i),
+    ejectDriver: (x, z, yaw) => crowd.eject(x, z, yaw),
     waterHeight: (x, z) => ocean.heightAt(x, z),
     setNight(f) {
       setFacadeNight(f);
@@ -234,8 +249,9 @@ export function buildWorld(): World {
       props.fronds.update(t);
       ocean.update(t);
       harbour.water.update(t);
-      crowd.update(dt, playerPos);
-      traffic.update(dt, playerPos);
+      panic.update(dt);
+      crowd.update(dt, playerPos, panic);
+      traffic.update(dt, playerPos, panic);
 
       // Moored boats ride the same waves the player's boat does.
       for (const b of boats.boats) {

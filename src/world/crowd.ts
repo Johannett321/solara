@@ -20,6 +20,7 @@ import {
 } from './layout';
 import type { BeachResult } from './beach';
 import type { HitZone, PersonTarget } from '../weapons/ballistics';
+import type { Panic } from './panic';
 
 /* ------------------------------------------------------------------ looks */
 
@@ -321,6 +322,12 @@ interface Agent {
   /** Which way they fold, set from the shot that killed them. */
   deathBack: number;
   deathSide: number;
+  /** 0 calm, 1 running for their life. Eased, so nobody snaps into a sprint. */
+  panic: number;
+  /** Walking speed before the panic, to go back to afterwards. */
+  calmSpeed: number;
+  /** Lane they were using before they scattered. */
+  calmLane: number;
   /** This agent's row in the shootable list. */
   target: PersonTarget;
 }
@@ -346,11 +353,19 @@ export interface Crowd {
    * or the ordinary walk swing — so the state has to be readable directly.
    */
   debug(index: number): Record<string, unknown> | null;
+  /**
+   * Put a new pedestrian on the street at run time, already running.
+   *
+   * Used for the driver hauled out of a car. Building a rig costs a few
+   * milliseconds, which is invisible as a one-off on a carjack and would not be
+   * as a spawner — this is not a general population system.
+   */
+  eject(x: number, z: number, yaw: number): void;
   /** The posed sunbathers and diners, baked. Chunked, so it culls per chunk. */
   posed: THREE.Group;
   /** Live pedestrian positions, for the map overlay. */
   positions(): THREE.Vector3[];
-  update(dt: number, playerPos: THREE.Vector3): void;
+  update(dt: number, playerPos: THREE.Vector3, panic: Panic): void;
 }
 
 /** Pedestrians past this range are hidden and stop animating. */
@@ -359,7 +374,12 @@ const CULL_DIST = 62;
 const LANES_EAST = [8.6, 9.8, 11.2, 13.4, 14.6];
 const LANES_WEST = [-8.6, -9.9, -11.4, -12.6];
 
-export function buildCrowd(colliders: Colliders, beach: BeachResult): Crowd {
+export function buildCrowd(
+  colliders: Colliders,
+  beach: BeachResult,
+  /** Hands a runtime-spawned agent to the culler, which is built later. */
+  onSpawn?: (c: Cullable) => void,
+): Crowd {
   const group = new THREE.Group();
   group.name = 'crowd';
   const rng = new Rng(24601);
@@ -449,6 +469,9 @@ export function buildCrowd(colliders: Colliders, beach: BeachResult): Crowd {
       injurySide: 1,
       deathBack: 1,
       deathSide: 1,
+      panic: 0,
+      calmSpeed: 0,
+      calmLane: x,
       rig,
       anim: new MaraAnimator(rig),
       pos,
@@ -695,6 +718,22 @@ export function buildCrowd(colliders: Colliders, beach: BeachResult): Crowd {
       a.speed = 0;
       a.idle = true;
     },
+    eject(x, z, yaw) {
+      const a = spawn(x, z, yaw, false, null, false);
+      if (!a) return;
+      // Straight into a run, away from the car, and frightened for a while even
+      // if the player never aimed at them.
+      a.heading = Math.abs(Math.sin(yaw)) > 0.5 ? (Math.sin(yaw) > 0 ? 1 : -1) : 1;
+      a.calmSpeed = 1.3;
+      a.calmLane = x;
+      a.speed = 4.4;
+      a.panic = 1;
+      a.flinch = 1;
+      a.flinchSide = 0;
+      // The culler has already been built by the time this runs, so the new
+      // agent has to be handed to it explicitly.
+      onSpawn?.(a.cull);
+    },
     debug(index) {
       const a = agents[index];
       if (!a) return null;
@@ -711,7 +750,7 @@ export function buildCrowd(colliders: Colliders, beach: BeachResult): Crowd {
       };
     },
     positions: () => [...agents.map((a) => a.pos), ...staticPositions],
-    update(dt, playerPos) {
+    update(dt, playerPos, panic) {
       for (const a of agents) {
         let moved = 0;
 
@@ -730,6 +769,40 @@ export function buildCrowd(colliders: Colliders, beach: BeachResult): Crowd {
         }
 
         a.flinch = Math.max(0, a.flinch - dt / FLINCH_TIME);
+
+        /* ---------------------------------------------------------- panic */
+
+        // Eased both ways: a street that snaps into a sprint on one frame reads
+        // as a bug, and one that snaps back to strolling reads as worse.
+        const fear = panic.at(a.pos.x, a.pos.z);
+        if (fear > a.panic) a.panic += (fear - a.panic) * Math.min(1, dt * 5);
+        else a.panic += (fear - a.panic) * Math.min(1, dt * 0.9);
+
+        if (a.panic > 0.02) {
+          if (a.calmSpeed === 0) {
+            a.calmSpeed = a.speed;
+            a.calmLane = a.lane;
+          }
+          // Standing about is not an option any more.
+          a.idle = false;
+          // Away from the trouble, along the street they are already on. The
+          // lane structure is kept rather than running in a straight line at
+          // the source: pedestrians who bolt across the carriageway end up
+          // inside the traffic and inside the buildings, and the promenade
+          // reads as a stampede perfectly well when everyone runs *down* it.
+          const away = a.pos.z - panic.centre.z;
+          if (Math.abs(away) > 0.5) a.heading = away > 0 ? 1 : -1;
+          const flat = a.injury === 'leg' ? 3.1 : 4.6;
+          a.speed = THREE.MathUtils.lerp(a.calmSpeed, flat, a.panic);
+          // Scatter off the neat walking lanes — a crowd running is not a queue.
+          a.lane = a.calmLane + Math.sin(a.bob * 3.1) * 1.5 * a.panic;
+        } else if (a.calmSpeed !== 0) {
+          // Back to a stroll, and back to the lane they were using.
+          a.speed = a.calmSpeed;
+          a.lane = a.calmLane;
+          a.idle = a.calmSpeed === 0;
+          a.calmSpeed = 0;
+        }
 
         if (!a.idle) {
           const step = a.speed * dt;
@@ -798,6 +871,7 @@ export function buildCrowd(colliders: Colliders, beach: BeachResult): Crowd {
         state.flinchHead = a.flinchHead;
         state.injury = a.injury;
         state.injurySide = a.injurySide;
+        state.panic = a.panic;
         a.anim.update(dt, state);
       }
     },

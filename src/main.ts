@@ -378,6 +378,18 @@ function exitBoat(): void {
 function enterCar(car: Drivable): void {
   audio.enterCar();
   stow();
+  // Carjacking: whoever was driving gets hauled out on the driver's side and
+  // runs. `onTaken` is how the traffic system learns to stop steering it.
+  car.onTaken?.();
+  if (car.hasDriver) {
+    car.hasDriver = false;
+    const right = new THREE.Vector3(Math.cos(car.yaw), 0, -Math.sin(car.yaw));
+    world.ejectDriver(
+      car.position.x - right.x * 1.7,
+      car.position.z - right.z * 1.7,
+      car.yaw,
+    );
+  }
   vehicle.enter(car);
   mode = 'driving';
   rig.root.visible = false;
@@ -569,6 +581,9 @@ function frame(): void {
       const spec = arsenal.spec;
       // No aiming with empty hands, and none while the wheel is up.
       const aiming = !!spec && input.aiming && !wheel.isOpen;
+      // Raising the sights sets the street off. Re-armed every frame it is
+      // held, so the panic outlives the aim rather than tracking it.
+      if (aiming) world.panic.alarm(controller.position);
       chase.setAim(aiming, spec ? spec.adsFov : 40);
       // Hold the camera's heading and strafe around it while aiming.
       controller.faceYaw = aiming ? chase.yaw : null;

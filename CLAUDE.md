@@ -186,10 +186,21 @@ walks every vertex on the CPU.
 ### Conventions that have caused repeat bugs
 
 - **Headings** are `forward = (sin yaw, cos yaw)` for Mara, cars and boats.
-- **Car meshes** point along local `+X`, so a car's `rotation.y` is always
-  `heading - PI/2`. Boat hulls are built pointing `+Z`, so boats use
+- **Car meshes point along local `-X`**, so a car's `rotation.y` is always
+  `heading + PI/2`. Boat hulls are built pointing `+Z`, so boats use
   `rotation.y = yaw` directly. Getting this wrong has broken parked cars, AI
   traffic and the hotel awnings, once each.
+
+  This entry said `+X` and `heading - PI/2` for a long time, and every car in
+  the world was consequently facing backwards — it only became obvious on
+  traffic, because that is the one that moves. The evidence is in the specs:
+  every `Spec.profile` runs nose-first and every `profile[0][0]` is negative,
+  so `front` is at **-X**, which is where `buildCar` puts the headlamps. If you
+  are ever unsure, measure it rather than reading it: compare a moving car's
+  world `-X` axis against its velocity, or check which end the white lamps are
+  on. Five call sites share the convention — both placements in
+  `world/cars.ts`, the spawn in `world/traffic.ts`, the car park in
+  `world/city.ts`, and `player/driving.ts`.
 - **Camera `yaw`** is the direction the camera *looks*; the rig sits opposite it.
 - **Grid winding**: hand-written grids invert their winding whenever a
   coordinate runs backwards. This bit five times (beach, ocean, park, wet sand,
@@ -464,6 +475,58 @@ project. `player/animator.ts` evaluates every joint angle per frame from a gait
 phase that advances with **distance actually travelled**, which is why the feet
 never skate.
 
+### Panic
+
+`world/panic.ts` is the street's reaction to a drawn weapon. Aiming calls
+`world.panic.alarm(position)` every frame it is held, which *re-arms* a timer
+rather than counting one up — so the panic outlives the aim by the full
+`PANIC_TIME` however briefly the player raised the sights.
+
+It is deliberately local. `Panic.at(x, z)` falls off with distance as well as
+with time, and returns 0 outside `PANIC_RADIUS`, so the edge of the effect is a
+fringe of people walking briskly rather than a circle with a stampede inside it.
+The city is 800 m across; a panic that reached all of it would cost the whole
+crowd and every traffic car an update every frame for a spectacle nobody can
+see.
+
+Two consumers, both easing in fast and out slowly:
+
+- Pedestrians run, and **keep their lane structure while doing it**. Running
+  directly away from the source instead sends them across the carriageway into
+  the traffic and into the buildings — the crowd has no world collision. A
+  promenade reads as a stampede perfectly well when everyone runs *along* it.
+  They also scatter off the neat walking lanes, because a crowd running is not
+  a queue.
+- Traffic floors it, tailgates and weaves. Headway compliance scales with fear
+  but **never reaches zero**, or a lane telescopes into one pile of cars. The
+  swerve is driven off `z` rather than a clock, so a car weaves along the road
+  instead of shimmying on the spot when stopped.
+
+### Every car is enterable
+
+`world.drivables` is the kerbside cars and the moving traffic in one list;
+`main.ts` finds the nearest without caring which it is. Two things make that
+affordable:
+
+- **Traffic colliders are created lazily.** Traffic drives through the player
+  rather than colliding, so a moving car needs no footprint — and 616 permanent
+  boxes would be paid for on every `Colliders.resolve` and on every 25 cm step
+  of the camera arm's `raycastXZ`, which is O(colliders). Only the handful the
+  player actually parks ever become real.
+- `DRIVABLE_EVERY` in `world/cars.ts` is now **1** — every kerbside car, where
+  it used to be one in three with the rest merged into the street. Measured
+  down a city avenue that costs 0.4 ms (46.3 → 45.5 fps) and 0.85 s of load,
+  which is affordable only because a parked car is 11 meshes rather than 28 and
+  because parked cars carry a 230 m draw range. It is the cheapest single knob
+  on the frame if the city ever gets denser.
+
+Taking a car with `hasDriver` set hauls the driver out: `crowd.eject` builds a
+new rig at run time and drops them on the pavement already running. Building a
+rig costs a few milliseconds, which is invisible as a one-off on a carjack and
+would not be as a spawner — this is not a general population system. A taken
+traffic car never rejoins the flow; `onTaken` tells the traffic system to let go
+of it for good.
+
 ### Weapons
 
 `weapons/` is the whole system: `specs.ts` is the data, `models.ts` builds the
@@ -547,6 +610,13 @@ Three things that were wrong first time:
   across the same duration. They have to stay matched — the sound is doing half
   the work, and the support hand has to be at the magazine when the first clack
   lands.
+- **Check audio levels on the analyser, not by ear.** The first reload was three
+  thin bandpassed clicks that measured 0.023 RMS on the master bus against an
+  0.020 ambience floor: they were playing correctly and were completely
+  inaudible. Every beat now carries a pitched body under the transient, which is
+  what makes a click read as metal. The band that works here is ambience ~0.020,
+  reload ~0.085, gunshot ~0.15 — a reload as loud as a gunshot is as wrong as a
+  silent one, and the first fix overshot to exactly that.
 
 #### Shooting people
 

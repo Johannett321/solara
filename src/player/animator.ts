@@ -145,6 +145,8 @@ export interface LocomotionState {
   /** A wound they are still carrying, which changes how they walk. */
   injury?: 'none' | 'leg' | 'arm' | 'gut';
   injurySide?: number;
+  /** 0 calm, 1 running from a drawn gun. */
+  panic?: number;
 }
 
 interface Link {
@@ -360,6 +362,9 @@ export class MaraAnimator {
     if (this.land > 0.001) this.poseLanding(this.land);
     if (this.swim > 0.001) this.poseSwim(this.swim, speed);
 
+    // Running scared goes on before the wound, so a limping runner still limps.
+    if (st.panic && st.panic > 0.02) this.posePanic(st.panic, ph, g);
+
     // A wound is carried into the walk itself, so it goes on before the aim
     // layer and after the gait it is modifying.
     if (st.injury && st.injury !== 'none' && REACTIONS.injury > 0) {
@@ -540,6 +545,42 @@ export class MaraAnimator {
       arm.shoulder.rotation.y = L(arm.shoulder.rotation.y, sgn * -0.3, k);
       arm.elbow.rotation.x = L(arm.elbow.rotation.x, -1.5, k);
     }
+  }
+
+  /**
+   * Running away.
+   *
+   * The gait solver already handles the *speed* — a panicking pedestrian is
+   * given a run and the legs follow. What it does not give is the posture, and
+   * a sprint with a commuter's upper body reads as someone late for a bus
+   * rather than someone running from a gun. So: shoulders up and forward, arms
+   * pumping high and tight, head down and turning to look back.
+   */
+  private posePanic(w: number, phase: number, gait: number): void {
+    const r = this.rig;
+    const L = THREE.MathUtils.lerp;
+    const k = Math.min(1, w) * gait;
+    if (k < 0.01) return;
+
+    // Hunched, and driving forward from the waist.
+    r.spine.rotation.x = L(r.spine.rotation.x, -0.3, k);
+    r.chest.rotation.x = L(r.chest.rotation.x, -0.16, k);
+
+    // Arms high and bent, pumping out of phase with the legs as they already do
+    // — this only tightens the elbow and lifts the whole swing.
+    for (const [arm, side, ph] of [
+      [r.armL, 1, phase + PI],
+      [r.armR, -1, phase],
+    ] as const) {
+      arm.shoulder.rotation.x = L(arm.shoulder.rotation.x, -0.95 * Math.cos(ph) - 0.22, k);
+      arm.shoulder.rotation.z = L(arm.shoulder.rotation.z, side * 0.2, k);
+      arm.elbow.rotation.x = L(arm.elbow.rotation.x, -1.5 - 0.35 * Math.max(0, Math.cos(ph)), k);
+    }
+
+    // Glancing back over the shoulder every couple of strides.
+    const glance = Math.sin(phase * 0.5) * 0.7;
+    r.head.rotation.y = L(r.head.rotation.y, glance, k);
+    r.head.rotation.x = L(r.head.rotation.x, 0.1 + Math.abs(glance) * 0.1, k);
   }
 
   /**
